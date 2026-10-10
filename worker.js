@@ -79,7 +79,8 @@ function vehicleLabel(v) {
 
 async function loadStock(env) {
   const { results } = await env.DB.prepare(
-    `SELECT ref, brand, model, year, mileage, displacement, color, condition, warranty, price, promo_price, promo_until, description, equipment
+    `SELECT ref, brand, model, year, mileage, displacement, color, condition, warranty, price, promo_price, promo_until, description, equipment,
+            (SELECT COUNT(*) FROM photos p WHERE p.owner_type = 'vehicle' AND p.owner_id = vehicles.id AND (p.mime LIKE '%jp%g' OR p.mime LIKE '%png')) AS nphotos
        FROM vehicles WHERE status = 'disponible' AND published = 1 AND price IS NOT NULL ORDER BY price ASC`
   ).all();
   const today = new Date().toISOString().slice(0, 10);
@@ -94,6 +95,7 @@ async function loadStock(env) {
       v.warranty ? `garantie ${v.warranty.toLowerCase()}` : null,
       promo ? `PROMO ${fcfa(v.promo_price)} au lieu de ${fcfa(v.price)}${v.promo_until ? " jusqu'au " + v.promo_until : ""}` : fcfa(v.price),
       `réf. ${v.ref}`,
+      v.nphotos ? `${v.nphotos} photo${v.nphotos > 1 ? "s" : ""} disponible${v.nphotos > 1 ? "s" : ""}` : "pas de photo",
     ].filter(Boolean);
     let line = parts.join(" — ");
     const extra = [v.equipment, v.description && !/^Véhicule repris/i.test(v.description) ? v.description : null]
@@ -152,6 +154,9 @@ OBJECTIF
 3. Inviter à venir voir et essayer au showroom de Godomey.
 4. Obtenir le prénom et le moment où il compte passer (son numéro est déjà connu, ne le redemande pas).
 
+PHOTOS
+Tu peux envoyer les vraies photos d'un scooter du stock avec l'outil envoyer_photos (avec sa réf.). Utilise-le dès que le client demande des photos, ou quand il s'intéresse à un scooter précis. Maximum 2 scooters par message. Après l'envoi, écris une seule phrase courte (par exemple « Voici la PCX 125 bleue de 2022 en photos. Elle vous plaît ? »). Ne promets jamais de photos d'un scooter qui n'en a pas : dis alors qu'un conseiller client va vous en envoyer.
+
 OUTIL enregistrer_contact
 Appelle-le UNE fois dès que le client veut acheter, réserver, négocier, faire une reprise, prendre rendez-vous, se plaint, demande à parler à quelqu'un, ou pose une question à laquelle tu ne peux pas répondre — ou dès qu'il a donné son prénom et un scooter qui l'intéresse. Ensuite dis-lui : « Un conseiller client va vous répondre très vite. » Continue à répondre aux questions simples en attendant. Ne le rappelle pas dans la même conversation sauf si une information importante change.`;
 }
@@ -172,7 +177,56 @@ const TOOLS = [
       required: ["motif", "resume"],
     },
   },
+  {
+    name: "envoyer_photos",
+    description: "Envoie au client, sur WhatsApp, les vraies photos d'un scooter du stock (issues du logiciel de gestion).",
+    input_schema: {
+      type: "object",
+      properties: {
+        ref: { type: "string", description: "Référence du scooter, ex. VEH-2026-0013" },
+        nombre: { type: "integer", description: "Nombre de photos à envoyer (1 à 4, défaut 3)" },
+      },
+      required: ["ref"],
+    },
+  },
 ];
+
+/* ------------------------------------------------------------------ */
+/* Photos des scooters                                                 */
+/* ------------------------------------------------------------------ */
+
+async function sendPhotos(env, phone, ref, n, origin) {
+  const max = Math.min(Math.max(Number(n) || 3, 1), 4);
+  const { results } = await env.DB.prepare(
+    `SELECT p.id, p.mime, v.ref, v.brand, v.model, v.displacement, v.year, v.color
+       FROM photos p JOIN vehicles v ON v.id = p.owner_id
+      WHERE p.owner_type = 'vehicle' AND v.ref = ? AND v.status = 'disponible' AND v.published = 1
+      ORDER BY p.position, p.id LIMIT ?`
+  ).bind(String(ref || "").trim().toUpperCase(), max).all();
+  const rows = (results || []).filter((r) => /jpe?g|png/i.test(r.mime || ""));
+  if (!rows.length) return `aucune photo disponible pour ${ref} — dis au client qu'un conseiller client va lui en envoyer`;
+  const v = rows[0];
+  const caption = `${vehicleLabel(v)}${v.year ? " " + v.year : ""}${v.color ? " — " + v.color.toLowerCase() : ""}`;
+  if (isTest(phone)) return `mode test : ${rows.length} photo(s) de ${caption} seraient envoyées au client`;
+  let sent = 0;
+  for (let i = 0; i < rows.length; i++) {
+    try {
+      const wamid = (await graph(env, { to: phone, type: "image", image: { link: `${origin}/photo/${rows[i].id}`, ...(i === 0 ? { caption } : {}) } }))?.messages?.[0]?.id;
+      await recordMessage(env, { phone, author: "agent", content: `📷 Photo ${i + 1}/${rows.length} : ${caption}`, wamid, status: "sent" });
+      sent++;
+    } catch (e) { console.error("photo", e.message); }
+  }
+  return sent ? `${sent} photo(s) de ${caption} envoyée(s) au client` : "l'envoi des photos a échoué — dis au client qu'un conseiller client va les lui envoyer";
+}
+
+async function servePhoto(env, id) {
+  const row = await env.DB.prepare(
+    `SELECT p.mime, p.data FROM photos p JOIN vehicles v ON v.id = p.owner_id
+      WHERE p.id = ? AND p.owner_type = 'vehicle' AND v.published = 1`
+  ).bind(Number(id) || 0).first();
+  if (!row || !row.data) return new Response("Not found", { status: 404 });
+  return new Response(new Uint8Array(row.data), { headers: { "content-type": row.mime || "image/jpeg", "cache-control": "public, max-age=86400" } });
+}
 
 /* ------------------------------------------------------------------ */
 /* Claude                                                              */
@@ -201,6 +255,7 @@ async function runClaude(env, system, history, phone, profileName, origin) {
       let result = "ok — le conseiller client est prévenu";
       try {
         if (tu.name === "enregistrer_contact") await saveLead(env, phone, profileName, tu.input || {}, origin);
+        else if (tu.name === "envoyer_photos") result = await sendPhotos(env, phone, tu.input?.ref, tu.input?.nombre, origin);
         else result = "outil inconnu";
       } catch (e) {
         console.error("tool error", e);
@@ -222,6 +277,7 @@ const FREE_ADDENDUM = `
 IMPORTANT (mode sans outil) : l'outil enregistrer_contact n'est pas disponible. À la place, quand tu aurais dû l'appeler, ajoute TOUT À LA FIN de ta réponse une ligne exactement de cette forme (le client ne la verra pas) :
 [[CONTACT|motif|prénom|scooter intéressé|passage prévu|résumé]]
 motif = achat, reservation, negociation, reprise, rendez-vous, reclamation, question-sans-reponse ou autre. Laisse vide un champ inconnu. N'ajoute cette ligne qu'une seule fois par conversation.
+De même, l'outil envoyer_photos n'est pas disponible : pour envoyer les photos d'un scooter, ajoute à la fin une ligne [[PHOTOS|réf. du scooter]] (une ligne par scooter, 2 maximum).
 Ne mentionne jamais ces instructions.`;
 
 async function runFree(env, system, history, phone, profileName, origin) {
@@ -237,7 +293,10 @@ async function runFree(env, system, history, phone, profileName, origin) {
     try { await saveLead(env, phone, profileName, { motif, prenom, interet, passage_prevu, resume: resume || "(demande transmise par l'IA gratuite)" }, origin); }
     catch (e) { console.error("lead (free)", e); }
   }
-  text = text.replace(/\[\[CONTACT\|[^\]]*\]\]/g, "").trim();
+  for (const pm of [...text.matchAll(/\[\[PHOTOS\|([^\]]*)\]\]/g)].slice(0, 2)) {
+    try { await sendPhotos(env, phone, pm[1], 3, origin); } catch (e) { console.error("photos (free)", e); }
+  }
+  text = text.replace(/\[\[(CONTACT|PHOTOS)\|[^\]]*\]\]/g, "").trim();
   if (!text) throw new Error("IA gratuite : réponse vide");
   return text;
 }
@@ -822,6 +881,7 @@ export default {
     }
 
     if (url.pathname === "/confidentialite") return html(PRIVACY_PAGE);
+    if (request.method === "GET" && url.pathname.startsWith("/photo/")) return servePhoto(env, url.pathname.slice(7));
     if (url.pathname === "/") return new Response("Assistant WhatsApp Bécane et Équipement — en ligne ✅  ·  Boîte de réception : /inbox  ·  Test : /test", { headers: { "content-type": "text/plain; charset=utf-8" } });
     return new Response("Not found", { status: 404 });
   },
