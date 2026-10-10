@@ -1,0 +1,14 @@
+{
+  "name": "becane-whatsapp",
+  "main": "worker.js",
+  "compatibility_date": "2025-09-01",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "becane-equipement",
+      "database_id": "075e4a71-0bc6-4e7a-81e6-0ac865e7011f"
+    }
+  ],
+  "ai": { "binding": "AI" },
+  "observability": { "enabled": true }
+}
