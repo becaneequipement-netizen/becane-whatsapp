@@ -389,13 +389,22 @@ async function servePhoto(env, id) {
 /* Claude                                                              */
 /* ------------------------------------------------------------------ */
 
-async function callClaude(env, system, messages) {
+// La réflexion interne du modèle compte dans max_tokens : avec un plafond trop bas, la réponse
+// arrivait coupée ou vide. On laisse donc de la marge et on demande un effort de réflexion faible.
+async function callClaude(env, system, messages, withEffort = true) {
+  const body = { model: cfg(env, "CLAUDE_MODEL"), max_tokens: 4096, system, tools: TOOLS, messages };
+  if (withEffort) body.output_config = { effort: "low" };
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: { "x-api-key": env.ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
-    body: JSON.stringify({ model: cfg(env, "CLAUDE_MODEL"), max_tokens: 700, system, tools: TOOLS, messages }),
+    body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error(`Claude ${res.status}: ${(await res.text()).slice(0, 500)}`);
+  if (!res.ok) {
+    const err = (await res.text()).slice(0, 500);
+    // Modèle qui n'accepte pas le réglage d'effort : on réessaie sans.
+    if (withEffort && res.status === 400 && /output_config|effort/i.test(err)) return callClaude(env, system, messages, false);
+    throw new Error(`Claude ${res.status}: ${err}`);
+  }
   return res.json();
 }
 
@@ -405,7 +414,11 @@ async function runClaude(env, system, history, phone, profileName, origin, stock
     const out = await callClaude(env, system, messages);
     const toolUses = (out.content || []).filter((b) => b.type === "tool_use");
     const text = (out.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n").trim();
-    if (out.stop_reason !== "tool_use" || !toolUses.length) return text;
+    if (out.stop_reason === "max_tokens") throw new Error("Claude : réponse coupée (max_tokens atteint)");
+    if (out.stop_reason !== "tool_use" || !toolUses.length) {
+      if (!text) throw new Error("Claude : réponse vide");
+      return text;
+    }
     messages.push({ role: "assistant", content: out.content });
     const results = [];
     for (const tu of toolUses) {
@@ -681,6 +694,9 @@ async function handleMessage(env, m, profile, origin) {
     reply = cleanReply((await runAgent(env, phone, contact?.name, await loadHistory(env, phone), origin)).text);
   } catch (e) {
     console.error(e);
+    reply = "";
+  }
+  if (!reply) {
     reply = "Merci pour votre message 🙏 Un conseiller client va vous répondre très vite.";
     await notifyNewMessage(env, contact, d.text, origin, "L'agent n'a pas pu répondre (Claude indisponible ou crédit épuisé) : répondez vous-même.");
   }
