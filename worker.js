@@ -362,7 +362,7 @@ Tiens la fiche à jour avec l'outil noter_prospect chaque fois que tu apprends q
 - en négociation : il discute le prix.
 - prêt à acheter : prix accepté, visite fixée, réservation ou achat demandé.
 - perdu : il a acheté ailleurs ou n'est plus intéressé.
-Écris d'abord ta réponse au client, puis appelle noter_prospect dans le même tour. Le client ne voit jamais cette fiche ; n'en parle pas. S'il demande qu'on ne le relance plus, mets ne_plus_contacter à vrai.
+Dès que le client donne son prénom, son budget ou son usage, note-le dans ce même tour. Écris d'abord ta réponse au client, puis appelle noter_prospect dans le même tour. Le client ne voit jamais cette fiche ; n'en parle pas. S'il demande qu'on ne le relance plus, mets ne_plus_contacter à vrai.
 
 MESSAGES DU CONSEILLER
 Dans l'historique, les messages qui commencent par « [Conseiller client] » ont été écrits par un conseiller de la concession. Ce qu'il a dit fait foi (prix accordé, rendez-vous, disponibilité) : reste cohérent avec lui et ne le contredis jamais.
@@ -551,6 +551,7 @@ async function runClaude(env, system, history, phone, profileName, origin, stock
       return text;
     }
     const results = [];
+    let after = null; // statut imposé par un accord ou une demande d'achat : appliqué après les autres mises à jour de la fiche
     for (const tu of toolUses) {
       let result = "ok — le conseiller client est prévenu";
       try {
@@ -559,7 +560,7 @@ async function runClaude(env, system, history, phone, profileName, origin, stock
           const check = checkAgreedPrice(stock, input);
           if (check.ok) {
             await saveLead(env, phone, profileName, input, origin);
-            await saveProspect(env, phone, { prenom: input.prenom, statut: input.prix_accorde || ["achat", "reservation", "rendez-vous"].includes(input.motif) ? "prêt à acheter" : undefined }).catch(() => {});
+            after = { prenom: input.prenom, statut: input.prix_accorde || ["achat", "reservation", "rendez-vous"].includes(input.motif) ? "prêt à acheter" : undefined };
           }
           if (check.message) result = check.message;
         }
@@ -572,6 +573,7 @@ async function runClaude(env, system, history, phone, profileName, origin, stock
       }
       results.push({ type: "tool_result", tool_use_id: tu.id, content: result });
     }
+    if (after) await saveProspect(env, phone, after).catch((e) => console.error("prospect", e));
     messages.push({ role: "user", content: results });
   }
   return "Merci pour votre message 🙏 Un conseiller client va vous répondre très vite.";
