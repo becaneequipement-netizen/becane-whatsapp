@@ -769,14 +769,33 @@ async function userMsgsToday(env, phone) {
   return r ? Number(r.n) : 0;
 }
 
+// E-mails au gérant : par Resend si une clé est configurée, sinon par l'envoi d'e-mails de Cloudflare
+// (liaison EMAIL, gratuite vers l'adresse de destination vérifiée du compte). Le dernier résultat est noté
+// dans wa_kv (mail_last_ok / mail_last_error) pour pouvoir diagnostiquer un e-mail qui n'arrive pas.
 async function sendEmail(env, subject, text) {
-  if (!env.RESEND_API_KEY) return;
-  const r = await fetch("https://api.resend.com/emails", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "content-type": "application/json" },
-    body: JSON.stringify({ from: cfg(env, "FROM_EMAIL"), to: [cfg(env, "NOTIFY_EMAIL")], subject: subject.slice(0, 150), text }),
-  });
-  if (!r.ok) console.error("resend", r.status, await r.text());
+  const note = (k, v) => env.DB.prepare(`INSERT INTO wa_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`).bind(k, String(v).slice(0, 500)).run().catch(() => {});
+  const to = cfg(env, "NOTIFY_EMAIL"), from = cfg(env, "FROM_EMAIL");
+  subject = subject.slice(0, 150);
+  try {
+    if (env.RESEND_API_KEY) {
+      const r = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "content-type": "application/json" },
+        body: JSON.stringify({ from, to: [to], subject, text }),
+      });
+      if (!r.ok) throw new Error(`Resend ${r.status}: ${(await r.text()).slice(0, 300)}`);
+      return void (await note("mail_last_ok", new Date().toISOString() + " resend"));
+    }
+    if (env.EMAIL) {
+      const addr = (from.match(/<([^>]+)>/) || [null, from])[1].trim();
+      await env.EMAIL.send({ to, from: addr, subject, text });
+      return void (await note("mail_last_ok", new Date().toISOString() + " cloudflare"));
+    }
+    throw new Error("aucun service d'e-mail configuré (ni RESEND_API_KEY, ni liaison EMAIL)");
+  } catch (e) {
+    console.error("mail", e.message);
+    await note("mail_last_error", new Date().toISOString() + " " + (e.message || e));
+  }
 }
 
 async function saveLead(env, phone, profileName, i, origin) {
@@ -1292,6 +1311,10 @@ export default {
       const kvGet = async (k) => (await env.DB.prepare(`SELECT v FROM wa_kv WHERE k = ?`).bind(k).first())?.v;
       const kvSet = (k, v) => env.DB.prepare(`INSERT INTO wa_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`).bind(k, String(v)).run();
       await upsertContact(env, phone, "Client test");
+      if (url.searchParams.get("mode") === "mail") {
+        await sendEmail(env, "✅ Test : les alertes de l'agent WhatsApp arrivent bien", "Ceci est un e-mail de test.\n\nC'est à cette adresse que l'agent WhatsApp vous prévient quand un client a besoin de vous : achat, réservation, prix à valider, question sans réponse.\n\nBoîte de réception : " + origin + "/inbox");
+        return json({ mail: "tenté" });
+      }
       if (url.searchParams.get("mode") === "relance") {
         ctx.waitUntil((async () => {
           const text = await buildRelance(env, phone, "Client test", origin, Number(url.searchParams.get("h")) || 6).catch((e) => "ERREUR " + e.message);
