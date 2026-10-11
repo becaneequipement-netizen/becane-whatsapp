@@ -1285,7 +1285,9 @@ export default {
         return json({ phone, relance: text || "PAS_DE_RELANCE" });
       }
       const transcript = [];
-      for (const t of (url.searchParams.get("t") || "").split("||").map((x) => x.trim()).filter(Boolean).slice(0, 4)) {
+      // Les messages du client viennent de l'URL (t=…) ou, pour les textes longs, de wa_kv (selftest_script_<s>).
+      const script = url.searchParams.get("t") || (await env.DB.prepare(`SELECT v FROM wa_kv WHERE k = ?`).bind("selftest_script_" + (url.searchParams.get("s") || "0")).first())?.v || "";
+      for (const t of script.split("||").map((x) => x.trim()).filter(Boolean).slice(0, 4)) {
         await recordMessage(env, { phone, author: "client", content: t.slice(0, 2000) });
         try {
           const out = await runAgent(env, phone, "Client test", await loadHistory(env, phone), origin);
