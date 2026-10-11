@@ -9,6 +9,15 @@
       "database_id": "075e4a71-0bc6-4e7a-81e6-0ac865e7011f"
     }
   ],
-  "ai": { "binding": "AI" },
-  "observability": { "enabled": true }
+  "ai": {
+    "binding": "AI"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "triggers": {
+    "crons": [
+      "*/30 * * * *"
+    ]
+  }
 }
