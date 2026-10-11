@@ -1274,29 +1274,40 @@ export default {
     }
 
     // Tests automatiques : actifs seulement tant qu'une clé temporaire existe dans wa_kv (selftest_key).
+    // Le scénario (messages du client séparés par ||) est lu dans wa_kv (selftest_script_<s>) et joué en arrière-plan ;
+    // chaque appel avance de quelques tours, la position est gardée dans selftest_pos_<s><r>.
     if (url.pathname === "/selftest" && request.method === "GET") {
       const row = await env.DB.prepare(`SELECT v FROM wa_kv WHERE k = 'selftest_key'`).first();
       if (!row || !row.v || row.v.length < 24 || !safeEqual(url.searchParams.get("key") || "", row.v)) return new Response("Not found", { status: 404 });
-      const phone = "testauto" + (url.searchParams.get("s") || "0").replace(/[^0-9]/g, "").slice(0, 10);
+      const s = (url.searchParams.get("s") || "0").replace(/[^0-9]/g, "").slice(0, 5);
+      const run = s + (url.searchParams.get("r") || "").replace(/[^0-9]/g, "").slice(0, 4);
+      const phone = "testauto" + run;
+      const kvGet = async (k) => (await env.DB.prepare(`SELECT v FROM wa_kv WHERE k = ?`).bind(k).first())?.v;
+      const kvSet = (k, v) => env.DB.prepare(`INSERT INTO wa_kv (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v`).bind(k, String(v)).run();
       await upsertContact(env, phone, "Client test");
       if (url.searchParams.get("mode") === "relance") {
-        const text = await buildRelance(env, phone, "Client test", origin, Number(url.searchParams.get("h")) || 6).catch((e) => "ERREUR " + e.message);
-        if (text) await recordMessage(env, { phone, author: "agent", content: "(relance) " + text });
-        return json({ phone, relance: text || "PAS_DE_RELANCE" });
+        ctx.waitUntil((async () => {
+          const text = await buildRelance(env, phone, "Client test", origin, Number(url.searchParams.get("h")) || 6).catch((e) => "ERREUR " + e.message);
+          await recordMessage(env, { phone, author: "agent", content: "(relance) " + (text || "PAS_DE_RELANCE") });
+        })());
+        return json({ phone, started: "relance" });
       }
-      const transcript = [];
-      // Les messages du client viennent de l'URL (t=…) ou, pour les textes longs, de wa_kv (selftest_script_<s>).
-      const script = url.searchParams.get("t") || (await env.DB.prepare(`SELECT v FROM wa_kv WHERE k = ?`).bind("selftest_script_" + (url.searchParams.get("s") || "0")).first())?.v || "";
-      for (const t of script.split("||").map((x) => x.trim()).filter(Boolean).slice(0, 4)) {
-        await recordMessage(env, { phone, author: "client", content: t.slice(0, 2000) });
-        try {
-          const out = await runAgent(env, phone, "Client test", await loadHistory(env, phone), origin);
-          const reply = cleanReply(out.text);
-          await recordMessage(env, { phone, author: "agent", content: reply || "(pas de réponse)" });
-          transcript.push({ client: t, agent: reply, engine: out.engine });
-        } catch (e) { transcript.push({ client: t, erreur: String(e.message || e) }); break; }
-      }
-      return json({ phone, transcript });
+      const turns = ((await kvGet("selftest_script_" + s)) || "").split("||").map((x) => x.trim()).filter(Boolean);
+      let pos = Number(await kvGet("selftest_pos_" + run)) || 0;
+      const started = Date.now();
+      ctx.waitUntil((async () => {
+        while (pos < turns.length && Date.now() - started < 16000) {
+          const t = turns[pos];
+          await recordMessage(env, { phone, author: "client", content: t.slice(0, 2000) });
+          try {
+            const out = await runAgent(env, phone, "Client test", await loadHistory(env, phone), origin);
+            await recordMessage(env, { phone, author: "agent", content: cleanReply(out.text) + (out.engine === "claude" ? "" : "  [moteur : " + out.engine + "]") });
+          } catch (e) { await recordMessage(env, { phone, author: "agent", content: "ERREUR " + String(e.message || e) }); }
+          pos++;
+          await kvSet("selftest_pos_" + run, pos);
+        }
+      })());
+      return json({ phone, from: pos, total: turns.length });
     }
 
     if (url.pathname === "/confidentialite") return html(PRIVACY_PAGE);
