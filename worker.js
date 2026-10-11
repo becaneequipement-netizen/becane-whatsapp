@@ -256,7 +256,7 @@ TON : ÉCRIS COMME UNE PERSONNE
 - Réagis d'abord à ce que le client vient de dire, puis réponds. Varie tes débuts de message : ne commence pas deux messages de suite par la même formule (« Je comprends », « Bien noté »).
 - Bannis le langage de formulaire : pas de « Comment puis-je vous aider ? », « Je n'ai pas le détail de cette partie », « des informations qui pourraient être inexactes », « N'hésitez pas à », « Je reste à votre disposition ».
 - Ne te présente pas comme « assistant », « assistant automatique », « robot » ou « IA » de toi-même. Salue une seule fois par conversation.
-- CIVILITÉ : adresse-toi au client avec « Monsieur » ou « Madame », jamais par son prénom seul. Avec son nom ou son prénom, écris « M. Serge » ou « Mme Aïcha » ; sans nom, « Monsieur » ou « Madame » en toutes lettres (« Bonjour Monsieur », « Très bien, Madame »). Place la civilité dans le salut et de temps en temps ensuite, pas à chaque message. Déduis Monsieur ou Madame du prénom donné, du nom WhatsApp ou de ce qu'il dit (« mon mari », « ma femme »). Si tu ne peux pas le savoir, n'en mets pas plutôt que de te tromper, jusqu'à ce que ce soit clair. N'écris jamais « Mr », « Mlle » ni « Monsieur/Madame ».
+- CIVILITÉ : adresse-toi au client avec « Monsieur » ou « Madame », jamais par son prénom seul. Avec son nom ou son prénom, écris « M. Serge » ou « Mme Aïcha » ; sans nom, « Monsieur » ou « Madame » en toutes lettres (« Bonjour Monsieur », « Très bien, Madame »). Place la civilité dans le salut et de temps en temps ensuite, pas à chaque message. Cela vaut aussi pour un client dont tu connais déjà le prénom par sa fiche ou par l'historique : « Bonjour M. Nestor », jamais « Bonjour Nestor ». Déduis Monsieur ou Madame du prénom donné, du nom WhatsApp ou de ce qu'il dit (« mon mari », « ma femme »). Si tu ne peux pas le savoir, n'en mets pas plutôt que de te tromper, jusqu'à ce que ce soit clair. N'écris jamais « Mr », « Mlle » ni « Monsieur/Madame ».
 - Réponses COURTES : 1 à 4 phrases. Une seule question par message : pose la plus utile, garde l'autre pour le message suivant.
 - Texte brut : pas de titres, pas de ** ni de #. Pour comparer des scooters, une ligne par scooter commençant par « • ».
 - 1 emoji maximum par message, pas obligatoire.
@@ -931,6 +931,7 @@ async function handleMessage(env, m, profile, origin) {
   }
 
   let reply;
+  const leadsBefore = await env.DB.prepare(`SELECT COUNT(*) AS n FROM wa_leads WHERE phone = ?`).bind(phone).first().then((r) => Number(r?.n) || 0).catch(() => 0);
   try {
     reply = cleanReply((await runAgent(env, phone, contact?.name, await loadHistory(env, phone), origin)).text);
   } catch (e) {
@@ -940,6 +941,12 @@ async function handleMessage(env, m, profile, origin) {
   if (!reply) {
     reply = "Merci pour votre message 🙏 Un conseiller client va vous répondre très vite.";
     await notifyNewMessage(env, contact, d.text, origin, "L'agent n'a pas pu répondre (Claude indisponible ou crédit épuisé) : répondez vous-même.");
+  }
+  // Filet de sécurité : l'agent annonce qu'un conseiller va répondre mais n'a rien transmis -> on prévient quand même le gérant.
+  if (reply && /conseiller/i.test(reply)) {
+    const leadsAfter = await env.DB.prepare(`SELECT COUNT(*) AS n FROM wa_leads WHERE phone = ?`).bind(phone).first().then((r) => Number(r?.n) || 0).catch(() => leadsBefore);
+    if (leadsAfter === leadsBefore)
+      await notifyNewMessage(env, contact, d.text, origin, "L'agent a dit au client qu'un conseiller allait lui répondre. Réponse de l'agent : « " + reply.slice(0, 400) + " »").catch(() => {});
   }
   // Si le gérant a pris la main pendant que l'agent réfléchissait, on n'envoie rien.
   const fresh = await env.DB.prepare(`SELECT paused_until FROM wa_contacts WHERE phone = ?`).bind(phone).first();
