@@ -97,7 +97,7 @@ function vehicleLabel(v) {
  */
 async function loadKv(env) {
   try {
-    const { results } = await env.DB.prepare(`SELECT k, v FROM wa_kv WHERE k LIKE 'nego_%' OR k IN ('knowledge_extra', 'relance_enabled')`).all();
+    const { results } = await env.DB.prepare(`SELECT k, v FROM wa_kv WHERE k LIKE 'nego_%' OR k IN ('knowledge_extra', 'relance_enabled', 'relance_template', 'relance_template_lang')`).all();
     return Object.fromEntries((results || []).map((r) => [r.k, r.v]));
   } catch (e) { console.error("kv", e.message); return {}; }
 }
@@ -997,6 +997,15 @@ async function authed(env, request) {
 
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
 
+const windowIsOpen = (c) => !!(c?.last_client_at && c.last_client_at > new Date(Date.now() - 24 * 3600e3).toISOString().slice(0, 19).replace("T", " "));
+function mediaKind(mime) {
+  if (/^image\/(jpeg|png)$/.test(mime)) return "image";
+  if (/^video\/(mp4|3gpp)$/.test(mime)) return "video";
+  if (/^audio\/(aac|mp4|mpeg|amr|ogg|x-m4a|m4a|mp3)$/.test(mime)) return "audio";
+  if (/^application\/(pdf|msword|vnd\.)/.test(mime) || mime === "text/plain") return "document";
+  return null;
+}
+
 async function inboxApi(env, request, url, origin) {
   const path = url.pathname.replace(/^\/inbox\/api\//, "");
 
@@ -1051,6 +1060,77 @@ async function inboxApi(env, request, url, origin) {
     }
     await recordMessage(env, { phone, author: "gerant", content: body, wamid, status: "sent" });
     return json({ ok: true, paused_until: until });
+  }
+
+  // Envoi d'une photo, d'une vidéo, d'un message audio ou d'un document par le conseiller.
+  if (request.method === "POST" && path === "send-media") {
+    const form = await request.formData().catch(() => null);
+    const phone = String(form?.get("phone") || "");
+    const file = form?.get("file");
+    const caption = String(form?.get("caption") || "").trim().slice(0, 1000);
+    if (!phone || !file || typeof file === "string" || !file.size) return json({ error: "Aucun fichier reçu" }, 400);
+    const c = await env.DB.prepare(`SELECT * FROM wa_contacts WHERE phone = ?`).bind(phone).first();
+    if (!c) return json({ error: "Conversation inconnue" }, 404);
+    if (!windowIsOpen(c)) return json({ error: "Le client ne vous a pas écrit depuis plus de 24 h : WhatsApp n'autorise pas à lui envoyer de fichier. Envoyez d'abord une relance." }, 409);
+    let mime = String(file.type || "").split(";")[0].toLowerCase();
+    if (mime === "audio/x-m4a" || mime === "audio/m4a") mime = "audio/mp4";
+    if (mime === "audio/mp3") mime = "audio/mpeg";
+    const kind = mediaKind(mime);
+    if (!kind) return json({ error: `Format non accepté par WhatsApp (${mime || "inconnu"}). Photos JPG/PNG, vidéos MP4, audios M4A/MP3/AAC/OGG, documents PDF.` }, 415);
+    const limit = { image: 5, video: 16, audio: 16, document: 100 }[kind] * 1048576;
+    if (file.size > limit) return json({ error: `Fichier trop lourd (${(file.size / 1048576).toFixed(1)} Mo) : WhatsApp accepte ${limit / 1048576} Mo maximum pour ce type.` }, 413);
+    const until = c.paused_until === FOREVER ? FOREVER : plusHoursSql(Number(cfg(env, "PAUSE_HOURS")));
+    await env.DB.prepare(`UPDATE wa_contacts SET paused_until = ? WHERE phone = ?`).bind(until, phone).run();
+    let mediaId, wamid;
+    try {
+      const up = new FormData();
+      up.append("messaging_product", "whatsapp");
+      up.append("type", mime);
+      up.append("file", new File([await file.arrayBuffer()], file.name || "fichier", { type: mime }));
+      const r = await fetch(`https://graph.facebook.com/${cfg(env, "GRAPH_VERSION")}/${env.WHATSAPP_PHONE_ID}/media`, { method: "POST", headers: { Authorization: `Bearer ${env.WHATSAPP_TOKEN}` }, body: up });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok || !d.id) throw new Error(d?.error?.message || `téléversement ${r.status}`);
+      mediaId = d.id;
+      const payload = { id: mediaId };
+      if (caption && (kind === "image" || kind === "video" || kind === "document")) payload.caption = caption;
+      if (kind === "document") payload.filename = file.name || "document";
+      wamid = (await graph(env, { to: phone, type: kind, [kind]: payload }))?.messages?.[0]?.id || null;
+    } catch (e) {
+      return json({ error: `Envoi refusé par WhatsApp : ${e.message}` }, 502);
+    }
+    const label = { image: "📷 Photo", video: "🎬 Vidéo", audio: "🎤 Message vocal", document: "📄 " + (file.name || "Document") }[kind];
+    await recordMessage(env, { phone, author: "gerant", content: caption && kind !== "audio" ? `${label} — ${caption}` : label, wamid, media_id: mediaId, media_type: kind, status: "sent" });
+    return json({ ok: true, paused_until: until });
+  }
+
+  // Relance : l'agent prépare le texte, le conseiller le relit puis l'envoie lui-même.
+  if (request.method === "POST" && path === "relance") {
+    const { phone } = await request.json().catch(() => ({}));
+    const c = await env.DB.prepare(`SELECT * FROM wa_contacts WHERE phone = ?`).bind(phone).first();
+    if (!c) return json({ error: "Conversation inconnue" }, 404);
+    const p = await env.DB.prepare(`SELECT no_contact FROM wa_prospects WHERE phone = ?`).bind(phone).first();
+    if (p?.no_contact) return json({ error: "Ce client a demandé à ne plus être relancé." }, 409);
+    const hours = c.last_client_at ? Math.max(1, Math.round((Date.now() - new Date(c.last_client_at.replace(" ", "T") + "Z").getTime()) / 3600e3)) : 24;
+    let text = null;
+    try { text = await buildRelance(env, phone, c.name, origin, hours); } catch (e) { return json({ error: "L'agent n'a pas pu préparer la relance : " + e.message }, 502); }
+    if (!text) text = `Bonjour${c.name ? " " + c.name.split(" ")[0] : ""} 🙏 Je reviens vers vous au sujet de votre demande. Avez-vous eu le temps d'y réfléchir ? Je reste disponible pour vous aider.`;
+    const kv = await loadKv(env);
+    return json({ text, window_open: windowIsOpen(c), template: !!kv.relance_template });
+  }
+
+  // Relance hors fenêtre de 24 h : seul un modèle de message approuvé par Meta est autorisé (wa_kv : relance_template, relance_template_lang).
+  if (request.method === "POST" && path === "relance-template") {
+    const { phone } = await request.json().catch(() => ({}));
+    const c = await env.DB.prepare(`SELECT * FROM wa_contacts WHERE phone = ?`).bind(phone).first();
+    if (!c) return json({ error: "Conversation inconnue" }, 404);
+    const kv = await loadKv(env);
+    if (!kv.relance_template) return json({ error: "Aucun modèle de relance n'est encore enregistré. Il faut d'abord créer et faire approuver un modèle de message dans WhatsApp Manager (Meta), puis me donner son nom." }, 409);
+    const first = (c.name || "").split(" ")[0] || "Cher client";
+    try {
+      const wamid = (await graph(env, { to: phone, type: "template", template: { name: kv.relance_template, language: { code: kv.relance_template_lang || "fr" }, components: [{ type: "body", parameters: [{ type: "text", text: first }] }] } }))?.messages?.[0]?.id || null;
+      await recordMessage(env, { phone, author: "gerant", content: `📨 Message de relance envoyé (modèle « ${kv.relance_template} »)`, wamid, status: "sent" });
+    } catch (e) { return json({ error: `Envoi refusé par WhatsApp : ${e.message}` }, 502); }
+    return json({ ok: true });
   }
 
   if (request.method === "POST" && path === "agent") {
@@ -1110,7 +1190,7 @@ header h1{font-size:17px;margin:0;flex:1}header small{color:var(--mut);display:b
 .msg.gerant{align-self:flex-end;background:var(--me);border-top-right-radius:2px}
 .who{font-size:11.5px;font-weight:700;margin-bottom:2px;color:#7fd1bd}.msg.gerant .who{color:#b5f5d9}
 .meta{font-size:11px;color:#a0b3bc;text-align:right;margin-top:2px}.meta .r{color:#53bdeb}.meta .f{color:var(--red)}
-.msg img{max-width:100%;border-radius:6px;display:block;margin-bottom:4px}.msg audio{max-width:240px;display:block;margin-bottom:4px}
+.msg img{max-width:100%;border-radius:6px;display:block;margin-bottom:4px}.msg audio{max-width:240px;display:block;margin-bottom:4px}.msg video{max-width:100%;border-radius:6px;display:block;margin-bottom:4px}
 .day{align-self:center;background:#182229;color:var(--mut);font-size:12px;padding:4px 10px;border-radius:8px;margin:8px 0}
 #bar{background:#182229;color:var(--mut);font-size:13px;padding:8px 14px;display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 #bar b{color:var(--txt)}#bar .sp{flex:1}
@@ -1120,7 +1200,7 @@ header h1{font-size:17px;margin:0;flex:1}header small{color:var(--mut);display:b
 #compose{display:flex;gap:8px;padding:8px 10px calc(8px + env(safe-area-inset-bottom));background:var(--head);align-items:flex-end}
 #compose textarea{flex:1;resize:none;border:0;border-radius:20px;padding:10px 14px;background:#2a3942;color:var(--txt);font:inherit;max-height:140px}
 #compose button{border:0;width:46px;height:46px;border-radius:50%;background:var(--acc);color:#111;font-size:20px;flex:none;cursor:pointer}
-#compose button:disabled{opacity:.4}#closed{background:#2b1d10;color:#ffd59a;font-size:13px;padding:10px 14px}
+#compose button.ib{background:#2a3942;color:var(--txt);width:40px;height:40px;font-size:18px}#compose button:disabled{opacity:.4}#closed{background:#2b1d10;color:#ffd59a;font-size:13px;padding:10px 14px}
 #err{background:#3a1418;color:#ffc0c7;font-size:13px;padding:8px 14px;display:none}
 .back{background:none;border:0;color:var(--txt);font-size:22px;padding:0 4px;cursor:pointer}
 a.call{color:var(--acc);text-decoration:none;font-size:20px}
@@ -1137,8 +1217,10 @@ a.call{color:var(--acc);text-decoration:none;font-size:20px}
   <div id="lead" hidden></div>
   <div id="thread" hidden></div>
   <div id="err"></div>
-  <div id="closed" hidden>Le client ne vous a pas écrit depuis plus de 24 h : WhatsApp n'autorise plus à lui écrire librement. Attendez qu'il vous réécrive, ou appelez-le.</div>
-  <form id="compose" hidden><textarea id="txt" rows="1" placeholder="Écrire au client…"></textarea><button id="send" title="Envoyer">➤</button></form>
+  <div id="closed" hidden>Le client ne vous a pas écrit depuis plus de 24 h : WhatsApp n'autorise plus à lui écrire librement. Vous pouvez lui envoyer un message de relance (modèle approuvé), ou l'appeler.<br><button class="btn resume" id="reltpl" type="button" style="margin-top:8px">Envoyer le message de relance</button></div>
+  <form id="compose" hidden><button type="button" class="ib" id="battach" title="Photo, vidéo ou document">📎</button><button type="button" class="ib" id="bvoice" title="Message audio">🎤</button><textarea id="txt" rows="1" placeholder="Écrire au client…"></textarea><button id="send" title="Envoyer">➤</button>
+   <input type="file" id="fattach" accept="image/jpeg,image/png,video/mp4,video/3gpp,application/pdf" hidden>
+   <input type="file" id="fvoice" accept="audio/*" capture hidden></form>
  </section>
 </div>
 <script>
@@ -1173,7 +1255,8 @@ function bubble(m){var b=el("div","msg "+m.author);b.dataset.id=m.id;
  if(m.author==="agent")b.appendChild(el("div","who","🤖 Assistant"));if(m.author==="gerant")b.appendChild(el("div","who","Vous"));
  if(m.media_id&&m.media_type==="image"){var i=el("img");i.loading="lazy";i.src="/inbox/media/"+encodeURIComponent(m.media_id);b.appendChild(i)}
  if(m.media_id&&m.media_type==="audio"){var a=el("audio");a.controls=true;a.preload="none";a.src="/inbox/media/"+encodeURIComponent(m.media_id);b.appendChild(a)}
- if(m.media_id&&(m.media_type==="video"||m.media_type==="document")){var l=el("a",null,"Ouvrir le fichier");l.href="/inbox/media/"+encodeURIComponent(m.media_id);l.target="_blank";l.style.color="#53bdeb";b.appendChild(l);b.appendChild(el("br"))}
+ if(m.media_id&&m.media_type==="video"){var v=el("video");v.controls=true;v.preload="none";v.src="/inbox/media/"+encodeURIComponent(m.media_id);b.appendChild(v)}
+ if(m.media_id&&m.media_type==="document"){var l=el("a",null,"Ouvrir le fichier");l.href="/inbox/media/"+encodeURIComponent(m.media_id);l.target="_blank";l.style.color="#53bdeb";b.appendChild(l);b.appendChild(el("br"))}
  b.appendChild(document.createTextNode(m.content));var mt=el("div","meta",hm(m.created_at));
  if(m.author!=="client"&&m.status){var s=el("span",m.status==="read"?"r":m.status==="failed"?"f":"", " "+STAT[m.status]);s.dataset.st="1";mt.appendChild(s)}
  b.appendChild(mt);return b}
@@ -1190,8 +1273,20 @@ function renderBar(c){var B=$("bar");B.innerHTML="";var s=el("span");
  if(c.paused){var forever=String(c.paused_until).indexOf("9999")===0;s.innerHTML="";s.appendChild(document.createTextNode("Agent "));s.appendChild(el("b",null,"en pause"));s.appendChild(document.createTextNode(forever?" — vous gérez ce client":" jusqu'à "+hm(c.paused_until)+" — vous gérez ce client"))}
  else{s.appendChild(document.createTextNode("Agent "));s.appendChild(el("b",null,"actif"));s.appendChild(document.createTextNode(" — il répond à ce client"))}
  B.appendChild(s);B.appendChild(el("span","sp"));var btn=el("button","btn "+(c.paused?"resume":"pause"),c.paused?"Réactiver l'agent":"Mettre en pause");
- btn.onclick=async function(){btn.disabled=true;try{await api("agent",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phone:cur,action:c.paused?"resume":"pause"})});await loadMsgs();loadConvs()}catch(e){showErr(e.message)}btn.disabled=false};B.appendChild(btn)}
-function showErr(t){var E=$("err");E.textContent=t;E.style.display="block";setTimeout(function(){E.style.display="none"},8000)}
+ btn.onclick=async function(){btn.disabled=true;try{await api("agent",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phone:cur,action:c.paused?"resume":"pause"})});await loadMsgs();loadConvs()}catch(e){showErr(e.message)}btn.disabled=false};B.appendChild(btn);
+ var rb=el("button","btn resume","Relancer");rb.style.background="#1f3a55";rb.style.color="#9fd0ff";rb.onclick=relancer;B.appendChild(rb)}
+async function relancer(){if(!cur)return;try{var j=await api("relance",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phone:cur})});
+ if(j.window_open){$("txt").value=j.text;autoGrow();$("txt").focus();showErr("Relance proposée par l'agent : relisez-la, modifiez-la si besoin, puis envoyez.")}
+ else{showErr(j.template?"Plus de 24 h : utilisez « Envoyer le message de relance » (modèle approuvé).":"Plus de 24 h : WhatsApp exige un modèle de message approuvé par Meta, pas encore enregistré. Texte proposé : "+j.text)}}catch(e){showErr(e.message)}}
+function showErr(t){var E=$("err");E.textContent=t;E.style.display="block";setTimeout(function(){E.style.display="none"},12000)}
+async function sendFile(f){if(!f||!cur||sending)return;sending=true;showErr("Envoi en cours…");
+ var fd=new FormData();fd.append("phone",cur);fd.append("file",f,f.name);fd.append("caption",$("txt").value.trim());
+ try{var r=await fetch("/inbox/api/send-media",{method:"POST",body:fd});if(r.status===401){location.href="/inbox";return}var j=await r.json();if(!r.ok)throw new Error(j.error||("Erreur "+r.status));
+  $("txt").value="";autoGrow();$("err").style.display="none";await loadMsgs();var T=$("thread");T.scrollTop=T.scrollHeight;loadConvs()}catch(x){showErr(x.message)}
+ sending=false}
+$("battach").onclick=function(){$("fattach").click()};$("bvoice").onclick=function(){$("fvoice").click()};
+$("fattach").onchange=function(){var f=this.files[0];this.value="";sendFile(f)};$("fvoice").onchange=function(){var f=this.files[0];this.value="";sendFile(f)};
+$("reltpl").onclick=async function(){if(!cur||!confirm("Envoyer le message de relance à ce client ?"))return;try{await api("relance-template",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phone:cur})});await loadMsgs();loadConvs()}catch(e){showErr(e.message)}}
 $("compose").onsubmit=async function(e){e.preventDefault();var t=$("txt").value.trim();if(!t||sending||!cur)return;sending=true;$("send").disabled=true;
  try{await api("send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({phone:cur,text:t})});$("txt").value="";autoGrow();await loadMsgs();var T=$("thread");T.scrollTop=T.scrollHeight;loadConvs()}catch(x){showErr(x.message)}
  sending=false;$("send").disabled=false};
