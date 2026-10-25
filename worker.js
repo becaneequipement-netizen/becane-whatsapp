@@ -40,6 +40,8 @@ const DEFAULTS = {
 const FOREVER = "9999-12-31 00:00:00";
 
 const SCHEMA = [
+  `CREATE TABLE IF NOT EXISTS wa_calls (call_id TEXT PRIMARY KEY, phone TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'ringing', sdp_offer TEXT,
+     created_at TEXT NOT NULL DEFAULT (datetime('now')), answered_at TEXT, ended_at TEXT, duration INTEGER)`,
   `CREATE TABLE IF NOT EXISTS wa_contacts (phone TEXT PRIMARY KEY, name TEXT, paused_until TEXT, unread INTEGER NOT NULL DEFAULT 0,
      last_at TEXT, last_text TEXT, last_client_at TEXT, notified_at TEXT, created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
   `CREATE TABLE IF NOT EXISTS wa_messages (id INTEGER PRIMARY KEY AUTOINCREMENT, phone TEXT NOT NULL, role TEXT NOT NULL,
@@ -965,6 +967,45 @@ async function handleStatus(env, s) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Appels WhatsApp reçus (le client appelle, le conseiller décroche)   */
+/* ------------------------------------------------------------------ */
+
+async function graphCalls(env, body) {
+  const res = await fetch(`https://graph.facebook.com/${cfg(env, "GRAPH_VERSION")}/${env.WHATSAPP_PHONE_ID}/calls`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${env.WHATSAPP_TOKEN}`, "content-type": "application/json" },
+    body: JSON.stringify({ messaging_product: "whatsapp", ...body }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { console.error("whatsapp calls", res.status, JSON.stringify(data)); throw new Error(data?.error?.message || `WhatsApp ${res.status}`); }
+  return data;
+}
+
+async function handleCall(env, call, profile, origin) {
+  if (!call?.id) return;
+  if (call.event === "connect" && call.direction !== "BUSINESS_INITIATED") {
+    const phone = call.from;
+    const seen = await env.DB.prepare(`INSERT OR IGNORE INTO wa_calls (call_id, phone, sdp_offer) VALUES (?, ?, ?)`).bind(call.id, phone, call.session?.sdp || null).run();
+    if (seen.meta && seen.meta.changes === 0) return;
+    const contact = await upsertContact(env, phone, profile?.name);
+    await recordMessage(env, { phone, author: "client", content: "📞 Appel WhatsApp entrant", wamid: "call:" + call.id });
+    await notifyNewMessage(env, contact, "📞 Appel WhatsApp entrant", origin, "Le client vous appelle sur WhatsApp : ouvrez la boîte de réception pour décrocher.").catch(() => {});
+    return;
+  }
+  if (call.event === "terminate") {
+    const row = await env.DB.prepare(`SELECT phone, status FROM wa_calls WHERE call_id = ?`).bind(call.id).first();
+    if (!row) return;
+    const answered = row.status === "answered";
+    const dur = Number(call.duration) || null;
+    await env.DB.prepare(`UPDATE wa_calls SET status = ?, ended_at = datetime('now'), duration = ? WHERE call_id = ?`).bind(answered ? "ended" : "missed", dur, call.id).run();
+    if (!answered && row.status === "ringing")
+      await recordMessage(env, { phone: row.phone, author: "client", content: "📞 Appel manqué" });
+    else if (answered)
+      await recordMessage(env, { phone: row.phone, author: "gerant", content: "📞 Appel terminé" + (dur ? " (" + Math.floor(dur / 60) + " min " + String(dur % 60).padStart(2, "0") + " s)" : ""), status: "sent" });
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /* Sécurité                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -1133,6 +1174,50 @@ async function inboxApi(env, request, url, origin) {
     return json({ ok: true });
   }
 
+  // ---- Appels reçus ----
+  if (request.method === "GET" && path === "calls-active") {
+    await env.DB.prepare(`UPDATE wa_calls SET status = 'missed', ended_at = datetime('now') WHERE status = 'ringing' AND created_at < datetime('now', '-70 seconds')`).run();
+    const { results } = await env.DB.prepare(
+      `SELECT k.call_id, k.phone, k.status, k.sdp_offer, c.name FROM wa_calls k LEFT JOIN wa_contacts c ON c.phone = k.phone
+        WHERE k.status = 'ringing' OR (k.status = 'answered' AND k.answered_at > datetime('now', '-4 hours')) ORDER BY k.created_at DESC LIMIT 5`
+    ).all();
+    return json({ calls: results || [] });
+  }
+  if (request.method === "POST" && path === "call-accept") {
+    const { call_id, sdp } = await request.json().catch(() => ({}));
+    const row = await env.DB.prepare(`SELECT * FROM wa_calls WHERE call_id = ?`).bind(call_id).first();
+    if (!row || row.status !== "ringing") return json({ error: "Cet appel n'est plus en cours." }, 409);
+    if (!sdp || typeof sdp !== "string") return json({ error: "Micro non initialisé" }, 400);
+    try { await graphCalls(env, { call_id, action: "accept", session: { sdp_type: "answer", sdp } }); }
+    catch (e) { return json({ error: "WhatsApp a refusé de décrocher : " + e.message }, 502); }
+    await env.DB.prepare(`UPDATE wa_calls SET status = 'answered', answered_at = datetime('now') WHERE call_id = ?`).bind(call_id).run();
+    await env.DB.prepare(`UPDATE wa_contacts SET paused_until = ? WHERE phone = ? AND (paused_until IS NULL OR paused_until < ?)`).bind(plusHoursSql(Number(cfg(env, "PAUSE_HOURS"))), row.phone, plusHoursSql(1)).run();
+    return json({ ok: true });
+  }
+  if (request.method === "POST" && (path === "call-reject" || path === "call-end")) {
+    const { call_id } = await request.json().catch(() => ({}));
+    const row = await env.DB.prepare(`SELECT * FROM wa_calls WHERE call_id = ?`).bind(call_id).first();
+    if (!row) return json({ error: "Appel inconnu" }, 404);
+    try { await graphCalls(env, { call_id, action: path === "call-reject" ? "reject" : "terminate" }); } catch (e) { console.error("call end", e.message); }
+    if (row.status === "ringing") {
+      await env.DB.prepare(`UPDATE wa_calls SET status = 'missed', ended_at = datetime('now') WHERE call_id = ?`).bind(call_id).run();
+      await recordMessage(env, { phone: row.phone, author: "gerant", content: "📞 Appel refusé", status: "sent" });
+    } else if (row.status === "answered") {
+      await env.DB.prepare(`UPDATE wa_calls SET status = 'ended', ended_at = datetime('now') WHERE call_id = ?`).bind(call_id).run();
+    }
+    return json({ ok: true });
+  }
+  // Active la réception d'appels sur le numéro (une seule fois).
+  if (request.method === "POST" && path === "calls-enable") {
+    const res = await fetch(`https://graph.facebook.com/${cfg(env, "GRAPH_VERSION")}/${env.WHATSAPP_PHONE_ID}/settings`, {
+      method: "POST", headers: { Authorization: `Bearer ${env.WHATSAPP_TOKEN}`, "content-type": "application/json" },
+      body: JSON.stringify({ calling: { status: "ENABLED", call_icon_visibility: "DEFAULT" } }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) return json({ error: d?.error?.message || `WhatsApp ${res.status}` }, 502);
+    return json({ ok: true });
+  }
+
   if (request.method === "POST" && path === "agent") {
     const { phone, action } = await request.json().catch(() => ({}));
     const value = action === "pause" ? FOREVER : null;
@@ -1205,11 +1290,14 @@ header h1{font-size:17px;margin:0;flex:1}header small{color:var(--mut);display:b
 .back{background:none;border:0;color:var(--txt);font-size:22px;padding:0 4px;cursor:pointer}
 a.call{color:var(--acc);text-decoration:none;font-size:20px}
 #placeholder{flex:1;display:grid;place-items:center;color:var(--mut);text-align:center;padding:30px}
+#callbox{position:fixed;left:0;right:0;top:0;z-index:50;background:#0b3d33;border-bottom:2px solid var(--acc);padding:14px 16px calc(14px);text-align:center;box-shadow:0 6px 20px #0008}
+#callbox .cc{max-width:420px;margin:auto}#ctitle{font-size:13px;color:#7fd1bd}#cwho{font-size:20px;font-weight:700;margin:4px 0}#cstate{color:#bfe9dc;font-size:13px;margin-bottom:10px}.cb{display:flex;gap:10px;justify-content:center}.cb .btn{padding:12px 26px;font-size:15px}
 @media (max-width:800px){#side{width:100%;border:0}#main{display:none}body.chat #side{display:none}body.chat #main{display:flex}}
 @media (min-width:801px){.back{display:none}}
 </style></head><body>
+<div id="callbox" hidden><div class="cc"><div id="ctitle">📞 Appel WhatsApp</div><div id="cwho"></div><div id="cstate"></div><div class="cb"><button type="button" class="btn" id="cno" style="background:#f15c6d;color:#111">Refuser</button><button type="button" class="btn resume" id="cyes">Décrocher</button></div></div></div><audio id="raudio" autoplay></audio>
 <div id="app">
- <section id="side"><header><div class="av" style="background:#00a884;color:#111">B</div><h1>Bécane et Équipement<small>WhatsApp · +229 01 41 66 33 33</small></h1></header><div id="list"><div id="empty">Chargement…</div></div></section>
+ <section id="side"><header><div class="av" style="background:#00a884;color:#111">B</div><h1>Bécane et Équipement<small>WhatsApp · +229 01 41 66 33 33</small></h1><button type="button" class="btn resume" id="callon" title="Activer la réception des appels WhatsApp">📞 Appels</button></header><div id="list"><div id="empty">Chargement…</div></div></section>
  <section id="main">
   <div id="placeholder">Choisissez une conversation.<br>L'agent répond seul ; dès que vous écrivez à un client, il se met en pause pour lui.</div>
   <header id="chead" hidden><button class="back" onclick="closeChat()">←</button><div class="av" id="cav"></div><h1 id="cname"></h1><a class="call" id="ccall" href="#" title="Appeler">📞</a></header>
@@ -1296,6 +1384,36 @@ $("txt").addEventListener("keydown",function(e){if(e.key==="Enter"&&!e.shiftKey&
 window.addEventListener("hashchange",function(){var h=location.hash.slice(1);if(h&&h!==cur)openChat(h)});
 loadConvs().then(function(){var h=location.hash.slice(1);if(h)openChat(h)});
 setInterval(loadConvs,5000);setInterval(loadMsgs,3000);
+var callCur=null,pc=null,mic=null,callBusy=false,callTimer=null,callStart=0;
+function endLocal(){if(pc){try{pc.close()}catch(e){}pc=null}if(mic){mic.getTracks().forEach(function(t){t.stop()});mic=null}$("raudio").srcObject=null;if(callTimer){clearInterval(callTimer);callTimer=null}}
+function showCall(c){$("callbox").hidden=false;var who=c.name||fmtPhone(c.phone);$("cwho").textContent=who;
+ if(c.status==="ringing"){$("cstate").textContent="Appel entrant…";$("cyes").hidden=false;$("cyes").textContent="Décrocher";$("cno").textContent="Refuser"}
+ else{$("cyes").hidden=true;$("cno").textContent="Raccrocher"}}
+async function pollCalls(){try{var j=await api("calls-active");var c=j.calls&&j.calls[0];
+ if(!c){if(callCur&&!callBusy){endLocal();callCur=null}$("callbox").hidden=true;return}
+ if(c.status==="answered"&&!pc){$("callbox").hidden=true;callCur=null;return}
+ if(!callCur||callCur.call_id!==c.call_id){callCur=c}else{callCur.status=c.status}
+ showCall(callCur)}catch(e){}}
+$("cyes").onclick=async function(){if(!callCur||callBusy)return;callBusy=true;$("cyes").disabled=true;$("cstate").textContent="Connexion…";
+ try{mic=await navigator.mediaDevices.getUserMedia({audio:true});
+  pc=new RTCPeerConnection({iceServers:[{urls:"stun:stun.l.google.com:19302"}]});
+  mic.getTracks().forEach(function(t){pc.addTrack(t,mic)});
+  pc.ontrack=function(e){$("raudio").srcObject=e.streams[0]};
+  await pc.setRemoteDescription({type:"offer",sdp:callCur.sdp_offer});
+  var ans=await pc.createAnswer();await pc.setLocalDescription(ans);
+  await new Promise(function(res){if(pc.iceGatheringState==="complete")return res();pc.onicegatheringstatechange=function(){if(pc.iceGatheringState==="complete")res()};setTimeout(res,2500)});
+  await api("call-accept",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({call_id:callCur.call_id,sdp:pc.localDescription.sdp})});
+  callCur.status="answered";callStart=Date.now();showCall(callCur);
+  callTimer=setInterval(function(){var s=Math.floor((Date.now()-callStart)/1000);$("cstate").textContent="En ligne · "+Math.floor(s/60)+":"+String(s%60).padStart(2,"0")},1000);
+  pc.onconnectionstatechange=function(){if(pc&&(pc.connectionState==="failed"||pc.connectionState==="closed"||pc.connectionState==="disconnected")){hangup(true)}};
+  loadConvs()}catch(e){endLocal();showErr(e.name==="NotAllowedError"?"Autorisez le micro dans le navigateur pour décrocher.":e.message);try{await api("call-end",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({call_id:callCur.call_id})})}catch(x){}callCur=null;$("callbox").hidden=true}
+ callBusy=false;$("cyes").disabled=false};
+async function hangup(silent){var c=callCur;if(!c)return;var ringing=c.status==="ringing";endLocal();callCur=null;$("callbox").hidden=true;
+ try{await api(ringing?"call-reject":"call-end",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({call_id:c.call_id})})}catch(e){if(!silent)showErr(e.message)}loadMsgs();loadConvs()}
+$("cno").onclick=function(){hangup(false)};
+$("callon").onclick=async function(){if(!confirm("Activer la réception des appels WhatsApp sur ce numéro ?"))return;try{await api("calls-enable",{method:"POST"});alert("Appels activés. Les clients voient maintenant le bouton d'appel WhatsApp.")}catch(e){alert(e.message)}};
+pollCalls();setInterval(pollCalls,2000);
+
 </script></body></html>`;
 
 /* ------------------------------------------------------------------ */
@@ -1378,6 +1496,10 @@ export default {
             jobs.push(handleMessage(env, m, profile, origin).catch((e) => console.error("message", e)));
           }
           for (const s of v.statuses || []) jobs.push(handleStatus(env, s).catch((e) => console.error("status", e)));
+          for (const call of v.calls || []) {
+            const profile = (v.contacts || []).find((c) => c.wa_id === call.from)?.profile;
+            jobs.push(handleCall(env, call, profile, origin).catch((e) => console.error("call", e)));
+          }
         }
       ctx.waitUntil(Promise.all(jobs));
       return new Response("ok");
