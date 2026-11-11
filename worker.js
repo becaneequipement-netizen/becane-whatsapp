@@ -22,7 +22,8 @@
  *
  * L'agent connaît les services et offres (lus en direct dans le logiciel : stock, pièces, livraison, horaires, paiements)
  * et négocie les prix dans la limite d'un dernier prix calculé d'après les ventes passées (voir priceFloor).
- * Il suit aussi les demandes d'importation (IMP-…) du client, reconnu par son numéro WhatsApp (voir loadImports).
+ * Il lit aussi le dossier du client reconnu par son numéro WhatsApp : achats et paiements, réservations, paiements par tranche,
+ * commandes de pièces, reprises et demandes d'importation (voir loadDossier).
  */
 
 const DEFAULTS = {
@@ -194,7 +195,32 @@ async function loadStock(env, kv = {}) {
 /* Services et offres, lus en direct dans le logiciel                  */
 /* ------------------------------------------------------------------ */
 
-/** Étapes d'une demande d'importation, dites avec des mots simples pour le client. */
+/* ------------------------------------------------------------------ */
+/* Dossier du client dans le logiciel                                  */
+/* ------------------------------------------------------------------ */
+// L'agent ne lit que ce qui est enregistré avec le numéro de téléphone qui écrit sur WhatsApp.
+// Jamais lus : coûts, marges, numéros de châssis ou moteur, notes internes, pièces d'identité.
+
+const SQL_PHONE = (col) => `replace(replace(replace(replace(${col}, ' ', ''), '+', ''), '-', ''), '.', '')`;
+
+/** Vrai si le téléphone enregistré dans le logiciel est bien le numéro WhatsApp (avec ou sans indicatif, ancien ou nouveau format béninois). */
+function samePhone(wa, stored) {
+  const a = String(wa || "").replace(/\D/g, "");
+  const b = String(stored || "").replace(/\D/g, "").replace(/^0+/, "");
+  if (a.length < 8 || b.length < 8) return false;
+  if (a === b) return true;
+  if (a.startsWith("229")) { // Bénin : 8 chiffres, précédés ou non de 01 et de l'indicatif 229
+    const l8 = a.slice(-8);
+    return [l8, "1" + l8, "229" + l8, "22901" + l8].includes(b);
+  }
+  return b.length >= 9 && a.endsWith(b); // autre pays : numéro enregistré sans l'indicatif
+}
+
+const frDay = (d) => { const m = String(d || "").match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]}` : ""; };
+const oneLine = (t, n) => String(t || "").replace(/\s+/g, " ").trim().slice(0, n);
+const idList = (rows) => rows.map((r) => Number(r.id)).filter((n) => Number.isInteger(n) && n > 0).join(",") || "0";
+const payLine = (p) => `${fcfa(p.amount)} le ${frDay(p.paid_at)}${p.mode ? " (" + oneLine(p.mode, 30).toLowerCase() + ")" : ""}${p.receipt_number ? ", reçu " + p.receipt_number : ""}`;
+
 const IMPORT_STEPS = {
   nouvelle: "demande bien reçue, en attente de prise en charge par la concession",
   recherche: "recherche en cours : la concession recherche le modèle demandé",
@@ -204,29 +230,141 @@ const IMPORT_STEPS = {
   terminee: "terminée : la demande est clôturée",
   annulee: "annulée",
 };
-const SQL_PHONE = (col) => `replace(replace(replace(replace(${col}, ' ', ''), '+', ''), '-', ''), '.', '')`;
+const RESERVATION_STEPS = { en_attente: "en attente de confirmation par la concession", confirmee: "confirmée", annulee: "annulée", expiree: "expirée" };
+const PLAN_STEPS = {
+  demande: "demande reçue, pas encore validée par la concession",
+  en_cours: "validée et en cours : le client verse ses tranches",
+  attribuee: "terminée : la moto a été attribuée au client",
+  refusee: "non retenue par la concession",
+  annulee: "annulée",
+};
+const ORDER_STEPS = { en_attente: "en attente de confirmation par la concession", confirmee: "confirmée", preparee: "préparée", livree: "remise au client", annulee: "annulée" };
+const TRADEIN_STEPS = {
+  nouvelle: "demande reçue, pas encore étudiée",
+  en_etude: "à l'étude",
+  estimee: "estimée : un conseiller client communique l'estimation",
+  acceptee: "acceptée",
+  refusee: "non retenue par la concession",
+};
 
 /**
- * Demandes d'importation déposées avec le numéro de téléphone qui écrit sur WhatsApp (8 derniers chiffres).
- * Un dossier déposé avec un autre numéro n'est jamais lu : l'agent ne peut donc rien en dire.
+ * Dossier du client : achats et paiements, réservations, paiements par tranche, commandes de pièces, reprises, importations.
+ * Renvoie { name, lines } ; lines est vide si rien n'est enregistré avec ce numéro.
  */
-async function loadImports(env, phone) {
+async function loadDossier(env, phone) {
   const digits = String(phone || "").replace(/\D/g, "");
-  if (digits.length < 8 || isTest(phone)) return [];
-  const { results } = await env.DB.prepare(
-    `SELECT number, wanted_model, year_range, budget, message, status, admin_note, created_at
-       FROM imports WHERE ${SQL_PHONE("phone")} LIKE ? ORDER BY id DESC LIMIT 5`
-  ).bind("%" + digits.slice(-8)).all();
-  const day = (d) => { const m = String(d || "").match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]}` : ""; };
-  const one = (t, n) => String(t || "").replace(/\s+/g, " ").trim().slice(0, n);
-  return (results || []).map((r) => [
-    `• ${r.number} — ${one(r.wanted_model, 80)}${r.year_range ? ", année " + one(r.year_range, 30) : ""}`,
-    Number(r.budget) > 0 ? `budget annoncé ${fcfa(r.budget)}` : null,
-    r.message ? `précision du client : « ${one(r.message, 200)} »` : null,
-    day(r.created_at) ? `déposée le ${day(r.created_at)}` : null,
+  if (digits.length < 8 || isTest(phone)) return { name: "", lines: [] };
+  const like = "%" + digits.slice(-8);
+  const q = async (sql, ...args) => { try { return (await env.DB.prepare(sql).bind(...args).all()).results || []; } catch (e) { console.error("dossier", e.message); return []; } };
+  const mine = (rows, ...cols) => rows.filter((r) => cols.some((c) => samePhone(phone, r[c])));
+
+  const [sales, reservations, plans, orders, tradeins, imports] = await Promise.all([
+    q(`SELECT s.id, s.number, s.invoice_number, s.price, s.tradein_value, s.sale_date, s.due_date, s.status, s.reservation_id,
+              c.name, c.phone, v.brand, v.model, v.displacement, v.year, v.color, v.warranty
+         FROM sales s JOIN customers c ON c.id = s.customer_id JOIN vehicles v ON v.id = s.vehicle_id
+        WHERE ${SQL_PHONE("c.phone")} LIKE ? ORDER BY s.id DESC LIMIT 5`, like).then((r) => mine(r, "phone")),
+    q(`SELECT r.id, r.number, r.name, r.phone, r.deposit, r.status, r.expires_at, r.created_at, v.brand, v.model, v.displacement, v.year, v.color
+         FROM reservations r JOIN vehicles v ON v.id = r.vehicle_id
+        WHERE ${SQL_PHONE("r.phone")} LIKE ? ORDER BY r.id DESC LIMIT 3`, like).then((r) => mine(r, "phone")),
+    q(`SELECT p.id, p.number, p.name, p.phone, p.wanted_model, p.total, p.months, p.first_payment, p.due_date, p.status, p.created_at,
+              (SELECT s.number FROM sales s WHERE s.id = p.sale_id) AS sale_number
+         FROM plans p WHERE ${SQL_PHONE("p.phone")} LIKE ? ORDER BY p.id DESC LIMIT 3`, like).then((r) => mine(r, "phone")),
+    q(`SELECT o.id, o.number, o.name, o.phone, o.total, o.delivery_mode, o.status, o.delivery_status, o.delivery_date, o.created_at,
+              (SELECT group_concat(i.qty || ' × ' || i.name, ', ') FROM order_items i WHERE i.order_id = o.id) AS items
+         FROM orders o WHERE ${SQL_PHONE("o.phone")} LIKE ? ORDER BY o.id DESC LIMIT 3`, like).then((r) => mine(r, "phone")),
+    q(`SELECT t.number, t.name, t.phone, t.whatsapp, t.brand, t.model, t.year, t.status, t.created_at
+         FROM tradeins t WHERE ${SQL_PHONE("t.phone")} LIKE ? OR ${SQL_PHONE("COALESCE(t.whatsapp, '')")} LIKE ? ORDER BY t.id DESC LIMIT 3`, like, like).then((r) => mine(r, "phone", "whatsapp")),
+    q(`SELECT number, name, phone, wanted_model, year_range, budget, message, status, admin_note, created_at
+         FROM imports WHERE ${SQL_PHONE("phone")} LIKE ? ORDER BY id DESC LIMIT 5`, like).then((r) => mine(r, "phone")),
+  ]);
+
+  // Paiements non annulés des achats, réservations et commandes trouvés, et versements des paiements par tranche.
+  const resaIds = [...reservations, ...sales.filter((s) => s.reservation_id).map((s) => ({ id: s.reservation_id }))];
+  const [pays, planPays] = await Promise.all([
+    sales.length || resaIds.length || orders.length
+      ? q(`SELECT target_type, target_id, amount, paid_at, mode, receipt_number FROM payments
+            WHERE voided_at IS NULL AND ((target_type = 'sale' AND target_id IN (${idList(sales)}))
+               OR (target_type = 'reservation' AND target_id IN (${idList(resaIds)}))
+               OR (target_type = 'order' AND target_id IN (${idList(orders)}))) ORDER BY paid_at, id`)
+      : [],
+    plans.length ? q(`SELECT plan_id, amount, paid_at, mode, receipt_number FROM plan_payments WHERE voided_at IS NULL AND plan_id IN (${idList(plans)}) ORDER BY paid_at, id`) : [],
+  ]);
+  const paid = (type, id) => pays.filter((p) => p.target_type === type && Number(p.target_id) === Number(id));
+  const sum = (rows) => rows.reduce((n, p) => n + (Number(p.amount) || 0), 0);
+  const moto = (v) => [vehicleLabel(v), v.year, v.color ? oneLine(v.color, 30).toLowerCase() : null].filter(Boolean).join(" ");
+  const join = (parts) => parts.filter(Boolean).join(" — ");
+  const lines = [];
+
+  for (const s of sales) {
+    const own = paid("sale", s.id), resa = s.reservation_id ? paid("reservation", s.reservation_id) : [];
+    const net = Number(s.price) - (Number(s.tradein_value) || 0);
+    let money;
+    if (s.status === "annulee") money = "VENTE ANNULÉE (ne donne aucun détail de paiement ni de remboursement : un conseiller client répond)";
+    else {
+      const due = s.due_date ? `, à régler au plus tard le ${frDay(s.due_date)}` : "";
+      const rest = s.status === "soldee" ? "ENTIÈREMENT PAYÉ, rien à régler"
+        : resa.length ? `total versé sur la vente ${fcfa(sum(own))}, plus un acompte de réservation de ${fcfa(sum(resa))} — RESTE À PAYER : à confirmer par un conseiller client${due}`
+        : `total versé ${fcfa(sum(own))} — RESTE À PAYER : ${fcfa(Math.max(0, net - sum(own)))}${due}`;
+      money = join([
+        `prix convenu ${fcfa(s.price)}`,
+        Number(s.tradein_value) > 0 ? `reprise déduite ${fcfa(s.tradein_value)}, soit ${fcfa(net)} à payer` : null,
+        own.length ? `versements : ${own.map(payLine).join(" ; ")}` : null,
+        rest,
+        s.warranty ? `garantie écrite sur la facture : ${oneLine(s.warranty, 60)}` : null,
+      ]);
+    }
+    lines.push(join([`• ACHAT ${s.number} (facture ${s.invoice_number}) du ${frDay(s.sale_date)}`, moto(s), money]));
+  }
+  for (const r of reservations) {
+    const p = paid("reservation", r.id);
+    lines.push(join([
+      `• RÉSERVATION ${r.number} du ${frDay(r.created_at)}`, moto(r),
+      `ÉTAT : ${RESERVATION_STEPS[r.status] || r.status}`,
+      p.length ? `acompte versé : ${p.map(payLine).join(" ; ")}` : Number(r.deposit) > 0 ? `acompte annoncé ${fcfa(r.deposit)}, aucun versement enregistré pour l'instant` : "aucun versement enregistré pour l'instant",
+      r.expires_at && ["en_attente", "confirmee"].includes(r.status) ? `valable jusqu'au ${frDay(r.expires_at)}` : null,
+    ]));
+  }
+  for (const p of plans) {
+    const v = planPays.filter((x) => Number(x.plan_id) === Number(p.id));
+    const head = `• PAIEMENT PAR TRANCHE ${p.number} du ${frDay(p.created_at)} — modèle souhaité : ${oneLine(p.wanted_model, 80)}`;
+    const state = `ÉTAT : ${PLAN_STEPS[p.status] || p.status}`;
+    if (p.status === "attribuee") lines.push(join([head, state, p.sale_number ? `la suite (versements, reste à payer) est dans l'achat ${p.sale_number}` : null]));
+    else if (p.status === "en_cours") lines.push(join([
+      head, state, `montant total ${fcfa(p.total)}`,
+      v.length ? `versements : ${v.map(payLine).join(" ; ")}` : "aucun versement enregistré pour l'instant",
+      `total versé ${fcfa(sum(v))} — RESTE À VERSER : ${fcfa(Math.max(0, Number(p.total) - sum(v)))}`,
+      p.due_date ? `à solder au plus tard le ${frDay(p.due_date)}` : null,
+    ]));
+    else if (p.status === "demande") lines.push(join([
+      head, state,
+      `proposition du client : ${fcfa(p.total)}${Number(p.months) > 0 ? " sur " + p.months + " mois" : ""}${Number(p.first_payment) > 0 ? ", premier versement " + fcfa(p.first_payment) : ""}`,
+    ]));
+    else lines.push(join([head, state]));
+  }
+  for (const o of orders) {
+    const p = paid("order", o.id);
+    lines.push(join([
+      `• COMMANDE DE PIÈCES ${o.number} du ${frDay(o.created_at)}`, o.items ? oneLine(o.items, 200) : null, `total ${fcfa(o.total)}`,
+      o.delivery_mode === "livraison" ? "en livraison" : "retrait au showroom",
+      `ÉTAT : ${ORDER_STEPS[o.status] || o.status}`,
+      o.status !== "annulee" && o.delivery_date ? `livraison prévue le ${frDay(o.delivery_date)}` : null,
+      o.status === "annulee" ? null : p.length ? `payé : ${p.map(payLine).join(" ; ")}` : "aucun paiement enregistré pour l'instant",
+    ]));
+  }
+  for (const t of tradeins) lines.push(join([
+    `• REPRISE ${t.number} du ${frDay(t.created_at)}`, [oneLine(t.brand, 30), oneLine(t.model, 40), t.year].filter(Boolean).join(" "),
+    `ÉTAT : ${TRADEIN_STEPS[t.status] || t.status}`,
+  ]));
+  for (const r of imports) lines.push(join([
+    `• IMPORTATION ${r.number} du ${frDay(r.created_at)}`, `${oneLine(r.wanted_model, 80)}${r.year_range ? ", année " + oneLine(r.year_range, 30) : ""}`,
+    Number(r.budget) > 0 ? `budget annoncé par le client ${fcfa(r.budget)}` : null,
+    r.message ? `précision du client : « ${oneLine(r.message, 200)} »` : null,
     `ÉTAPE ACTUELLE : ${IMPORT_STEPS[r.status] || r.status}`,
-    r.admin_note ? `message de la concession pour le client : « ${one(r.admin_note, 400)} »` : null,
-  ].filter(Boolean).join(" — "));
+    r.admin_note ? `message de la concession pour le client : « ${oneLine(r.admin_note, 400)} »` : null,
+  ]));
+
+  const name = oneLine((sales[0] || reservations[0] || plans[0] || orders[0] || imports[0] || tradeins[0] || {}).name, 60);
+  return { name, lines };
 }
 
 const PART_CATEGORY = { moteur: "Moteur", freinage: "Freinage", carrosserie: "Carrosserie", electricite: "Électricité", pneus: "Pneus", batteries: "Batteries", entretien: "Entretien", accessoires: "Accessoires" };
@@ -234,7 +372,7 @@ const PART_CATEGORY = { moteur: "Moteur", freinage: "Freinage", carrosserie: "Ca
 async function loadKnowledge(env, phone) {
   const safe = async (p, def) => { try { return await p; } catch (e) { console.error("knowledge", e.message); return def; } };
   const digits = String(phone || "").replace(/\D/g, "");
-  const [settings, zones, parts, leads, prospect, bought, imports] = await Promise.all([
+  const [settings, zones, parts, leads, prospect, bought, dossier] = await Promise.all([
     safe(env.DB.prepare(`SELECT key, value FROM settings WHERE key IN ('hours', 'payment_modes', 'reservation_days')`).all().then((r) => r.results || []), []),
     safe(env.DB.prepare(`SELECT name, fee FROM delivery_zones WHERE active = 1 ORDER BY fee, name`).all().then((r) => r.results || []), []),
     safe(env.DB.prepare(`SELECT name, category, price, stock FROM parts WHERE published = 1 ORDER BY category, price LIMIT 80`).all().then((r) => r.results || []), []),
@@ -247,7 +385,7 @@ async function loadKnowledge(env, phone) {
             WHERE s.status != 'annulee' AND replace(replace(replace(replace(c.phone, ' ', ''), '+', ''), '-', ''), '.', '') LIKE ?`
         ).bind("%" + digits.slice(-8)).first().then((r) => Number(r?.n) > 0), false)
       : false,
-    safe(loadImports(env, phone), []),
+    safe(loadDossier(env, phone), { name: "", lines: [] }),
   ]);
   const s = Object.fromEntries(settings.map((r) => [r.key, r.value]));
   let modes = [];
@@ -256,7 +394,7 @@ async function loadKnowledge(env, phone) {
   const paid = zones.filter((z) => Number(z.fee) > 0).map((z) => `${z.name} ${fcfa(z.fee)}`);
   const cap = (t) => { t = String(t || "").trim().toLowerCase(); return t.replace(/(^|[\s-])\S/g, (c) => c.toUpperCase()); };
   return {
-    prospect, bought, imports,
+    prospect, bought, dossier: dossier.lines, dossierName: dossier.name,
     hours: s.hours || "",
     modes: Array.isArray(modes) ? modes : [],
     reservationDays: Number(s.reservation_days) || 7,
@@ -422,15 +560,19 @@ Tiens la fiche à jour avec l'outil noter_prospect chaque fois que tu apprends q
 - perdu : il a acheté ailleurs ou n'est plus intéressé.
 Dès que le client donne son prénom, son budget ou son usage, note-le dans ce même tour. Écris d'abord ta réponse au client, puis appelle noter_prospect dans le même tour. Le client ne voit jamais cette fiche ; n'en parle pas. S'il demande qu'on ne le relance plus, mets ne_plus_contacter à vrai.
 
-SUIVI DES DEMANDES D'IMPORTATION
-${know.imports && know.imports.length ? `Demandes d'importation déposées avec le numéro WhatsApp de ce client (lues à l'instant dans le logiciel de la concession) :
-${know.imports.join("\n")}
-- Quand il demande où en est sa demande, réponds toi-même, tout de suite : rappelle le modèle demandé et dis l'étape actuelle avec des mots simples. S'il y a un message de la concession pour lui, transmets-le fidèlement.
-- Tu ne connais que l'étape actuelle. N'invente ni la suite, ni une date, ni un délai chiffré, ni un véhicule trouvé, ni un prix. S'il veut plus de détails que ce qui est écrit ici (délai, véhicule trouvé, montant à payer), dis ce que tu sais, puis qu'un conseiller client va lui répondre très vite, et appelle enregistrer_contact (motif question-sans-reponse).
-- Une simple demande de suivi à laquelle tu as répondu ne demande PAS d'appeler enregistrer_contact.
-- Étape « en validation » : précise qu'un conseiller client le contacte pour valider la proposition avec lui. Demande annulée : dis-le avec tact et propose qu'un conseiller client lui en parle (enregistrer_contact).
-- S'il cite un numéro IMP-… qui n'est pas dans cette liste : voir la règle ci-dessous.` : "Aucune demande d'importation n'est enregistrée avec le numéro WhatsApp de ce client."}
-- Numéro IMP-… absent de la liste ci-dessus : tu n'as accès qu'aux demandes déposées avec le numéro de téléphone qui t'écrit. Dis simplement que tu ne retrouves pas cette demande avec ce numéro WhatsApp, demande-lui avec quel numéro de téléphone il l'a déposée, dis qu'un conseiller client va lui répondre très vite, et appelle enregistrer_contact (motif question-sans-reponse, avec le numéro IMP-… dans le résumé). Rappelle qu'il peut aussi la suivre sur becaneetequipement.com/importation avec le numéro reçu. Ne dis jamais qu'une demande existe ou n'existe pas, et ne donne aucune information sur une demande qui n'est pas dans la liste.
+DOSSIER DE CE CLIENT DANS LE LOGICIEL
+${know.dossier && know.dossier.length ? `Voici ce qui est enregistré dans le logiciel de la concession avec le numéro WhatsApp qui t'écrit (lu à l'instant).${know.dossierName ? ` Nom enregistré : ${know.dossierName}.` : ""} C'est SON dossier : tu peux lui en parler, à lui seul.
+${know.dossier.join("\n")}
+- Quand il demande où en est une demande, ce qu'il a payé, ce qu'il lui reste à payer, une échéance, sa garantie, un numéro de facture ou de reçu : réponds toi-même, tout de suite, avec ce qui est écrit ci-dessus. Une simple question de suivi à laquelle tu as répondu ne demande PAS d'appeler enregistrer_contact.
+- Les montants et les dates : cite exactement ceux qui sont écrits. Ne refais aucun calcul, n'arrondis pas, n'invente ni versement, ni échéance, ni délai, ni étape suivante. Quand il est écrit « à confirmer par un conseiller client », ne donne pas de chiffre : dis qu'un conseiller client va lui confirmer le montant.
+- Ne réclame jamais un paiement de toi-même et ne parle d'un reste à payer que si le client pose la question. Jamais de reproche ni de pression sur un retard.
+- Tu ne modifies rien : annulation, remboursement, report d'échéance, changement de moto ou de montant, envoi d'une facture ou d'un reçu, estimation d'une reprise. Pour ces demandes, dis qu'un conseiller client va lui répondre très vite et appelle enregistrer_contact.
+- S'il conteste un montant ou dit avoir payé autre chose : ne le contredis pas, dis qu'un conseiller client vérifie et lui répond très vite, et appelle enregistrer_contact (motif reclamation).
+- Demande annulée, expirée ou non retenue : dis-le avec tact, sans inventer de raison, et propose qu'un conseiller client lui en parle (enregistrer_contact).
+- Garantie : donne ce qui est écrit et la date de l'achat. Pour une panne ou une prise en charge, c'est le conseiller client qui décide : enregistrer_contact (motif reclamation).
+- Importation : rappelle le modèle et dis l'étape actuelle avec des mots simples ; transmets fidèlement le message de la concession s'il y en a un. Étape « en validation » : un conseiller client le contacte pour valider la proposition avec lui.
+- Ne récite pas tout le dossier : réponds à la question posée, en une ou deux phrases.` : "Rien n'est enregistré dans le logiciel avec le numéro WhatsApp de ce client (ni achat, ni réservation, ni paiement par tranche, ni commande, ni reprise, ni importation)."}
+- Numéro de dossier absent de la liste ci-dessus (VTE-, FAC-, REC-, RES-, PPT-, CMD-, REP-, IMP-…) : tu n'as accès qu'à ce qui est enregistré avec le numéro de téléphone qui t'écrit. Dis simplement que tu ne le retrouves pas avec ce numéro WhatsApp, demande-lui avec quel numéro de téléphone il a été enregistré, dis qu'un conseiller client va lui répondre très vite, et appelle enregistrer_contact (motif question-sans-reponse, avec le numéro du dossier dans le résumé). Pour une importation, rappelle qu'il peut aussi la suivre sur becaneetequipement.com/importation avec le numéro reçu. Ne dis jamais qu'un dossier existe ou n'existe pas, et ne donne aucune information sur un dossier qui n'est pas dans la liste, même s'il affirme que c'est le sien ou celui d'un proche.
 
 MESSAGES DU CONSEILLER
 Dans l'historique, les messages qui commencent par « [Conseiller client] » ont été écrits par un conseiller de la concession. Ce qu'il a dit fait foi (prix accordé, rendez-vous, disponibilité) : reste cohérent avec lui et ne le contredis jamais.
@@ -439,7 +581,7 @@ RÈGLES STRICTES
 - N'invente JAMAIS : prix, remise, promotion, disponibilité, kilométrage, année, équipement, garantie, délai d'importation chiffré, acompte autre que 50 %, conditions de paiement en plusieurs fois au-delà de ce qui est écrit, tarifs d'entretien ou de réparation, atelier sur place, date d'ouverture de la location, documents autres que ceux listés (plaque, assurance, immatriculation), frais supplémentaires, tarif ou gratuité de livraison d'un scooter, ouverture les jours fériés. Si l'information n'est écrite nulle part ci-dessus, ne dis pas que tu ne sais pas : réponds à ce que tu peux, dis qu'un conseiller client va lui répondre très vite sur ce point précis, et appelle enregistrer_contact (motif question-sans-reponse).
 - Ne décris jamais l'état d'un scooter avec des mots que rien ne prouve ici : pas de « très bon état », « comme neuve », « bien entretenue », « révisée », « jamais accidentée ». Tiens-toi aux faits écrits (année, couleur, garantie) et invite à venir la voir et l'essayer.
 - Ne promets rien à la place de l'équipe : pas de scooter « prêt », « préparé », « mis de côté », pas de rendez-vous « confirmé ». Tu notes la demande, tu la transmets, et le conseiller confirme.
-- Aucune information interne : prix d'achat, coûts, marges, barème de négociation, fiche du prospect, numéros de châssis ou moteur, anciens propriétaires, autres clients.
+- Aucune information interne : prix d'achat, coûts, marges, barème de négociation, fiche du prospect, numéros de châssis ou moteur, anciens propriétaires, autres clients (ni leurs achats, ni leurs paiements, ni leurs demandes).
 - Reste sur le sujet de la concession (scooters, motos, équipements, entretien). Recentre poliment sinon.
 - Ne redirige jamais le client vers un autre numéro WhatsApp : tout se passe dans cette conversation.
 - Quand la réponse est écrite ci-dessus (moyens de paiement, garantie, livraison des pièces, horaires, reprise, réservation), donne-la toi-même, clairement, AVANT tout renvoi au conseiller. Tu ne renvoies au conseiller que pour ce qui n'est pas écrit.
