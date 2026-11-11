@@ -5,6 +5,8 @@
  * Secrets (Settings > Variables and Secrets) :
  *   ACHAT_API_KEY   -> clé API Claude réservée à l'agent d'achat (facultatif : à défaut, la clé ANTHROPIC_API_KEY de l'agent WhatsApp)
  *   ACHAT_PASSWORD  -> mot de passe de l'application (à défaut : INBOX_PASSWORD)
+ * Un mot de passe propre à l'application peut aussi être enregistré, haché, dans achat_docs (ligne auth/main :
+ * {salt, hash} avec hash = SHA-256 de « salt:mot de passe »). Il est accepté en plus de celui des secrets.
  * Variable facultative : ACHAT_MODEL (défaut : claude-sonnet-5-5)
  *
  * Données : table achat_docs de la base D1 (fournisseurs, missions, taux). Le logiciel n'est lu qu'en lecture.
@@ -37,9 +39,23 @@ function safeEqual(a, b) {
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
   return diff === 0;
 }
-const sessionToken = (env) => hmacHex(password(env), "achat-session-v1");
+async function sha256Hex(t) { return [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(t)))].map((b) => b.toString(16).padStart(2, "0")).join(""); }
+/** Mot de passe propre à l'application, stocké haché (jamais lisible par l'API de l'application). */
+async function storedAuth(env) {
+  try { const r = await env.DB.prepare(`SELECT data FROM achat_docs WHERE path = 'auth/main'`).first(); const d = r ? parse(r.data) : null; return d && /^[a-f0-9]{64}$/.test(d.hash || "") && d.salt ? d : null; }
+  catch { return null; }
+}
+async function passwordOk(env, given) {
+  if (!given) return false;
+  const a = await storedAuth(env);
+  const okStored = a ? safeEqual(await sha256Hex(a.salt + ":" + given), a.hash) : false;
+  const okEnv = password(env) ? safeEqual(await hmacHex("achat-login", given), await hmacHex("achat-login", password(env))) : false;
+  return okStored || okEnv;
+}
+async function sessionSecret(env) { const a = await storedAuth(env); return password(env) || a ? password(env) + "|" + (a ? a.hash : "") : ""; }
+async function sessionToken(env) { return hmacHex(await sessionSecret(env), "achat-session-v1"); }
 async function authed(request, env) {
-  if (!password(env)) return false;
+  if (!(await sessionSecret(env))) return false;
   const m = (request.headers.get("cookie") || "").match(/(?:^|;\s*)ax=([a-f0-9]{64})/);
   return !!m && safeEqual(m[1], await sessionToken(env));
 }
@@ -190,14 +206,16 @@ export async function handleAchat(request, env, ctx, path, base) {
   if (path === "/icon.svg") return new Response(ICON, { headers: { "content-type": "image/svg+xml", "cache-control": "public, max-age=86400" } });
   if (path === "/manifest.webmanifest") return new Response(JSON.stringify({ name: "Bureau d'achat BECANE", short_name: "Bureau d'achat", start_url: base + "/", scope: base + "/", display: "standalone", background_color: "#0B1F3A", theme_color: "#0B1F3A", icons: [{ src: base + "/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any" }] }), { headers: { "content-type": "application/manifest+json" } });
   if (path === "/login" && request.method === "POST") {
+    await ensureSchema(env);
     const form = await request.formData().catch(() => null);
     const given = String(form?.get("password") || "");
-    if (!password(env) || !safeEqual(await hmacHex("achat-login", given), await hmacHex("achat-login", password(env)))) {
+    if (!(await passwordOk(env, given))) {
       await new Promise((r) => setTimeout(r, 800));
-      return html(LOGIN(base, password(env) ? "Mot de passe incorrect." : "Aucun mot de passe n'est configuré pour cette application."), 401);
+      return html(LOGIN(base, (await sessionSecret(env)) ? "Mot de passe incorrect." : "Aucun mot de passe n'est configuré pour cette application."), 401);
     }
     return new Response(null, { status: 303, headers: { location: base + "/", "set-cookie": `ax=${await sessionToken(env)}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=${90 * 86400}` } });
   }
+  await ensureSchema(env);
   if (path === "/logout") return new Response(null, { status: 303, headers: { location: base + "/", "set-cookie": "ax=; Path=/; Max-Age=0" } });
   const ok = await authed(request, env);
   if (path === "" || path === "/") return ok ? html(PAGE) : html(LOGIN(base, ""));
