@@ -22,6 +22,7 @@
  *
  * L'agent connaît les services et offres (lus en direct dans le logiciel : stock, pièces, livraison, horaires, paiements)
  * et négocie les prix dans la limite d'un dernier prix calculé d'après les ventes passées (voir priceFloor).
+ * Il suit aussi les demandes d'importation (IMP-…) du client, reconnu par son numéro WhatsApp (voir loadImports).
  */
 
 const DEFAULTS = {
@@ -193,12 +194,47 @@ async function loadStock(env, kv = {}) {
 /* Services et offres, lus en direct dans le logiciel                  */
 /* ------------------------------------------------------------------ */
 
+/** Étapes d'une demande d'importation, dites avec des mots simples pour le client. */
+const IMPORT_STEPS = {
+  nouvelle: "demande bien reçue, en attente de prise en charge par la concession",
+  recherche: "recherche en cours : la concession recherche le modèle demandé",
+  validation: "en validation : une proposition est à valider avec le client avant de lancer l'importation",
+  importation: "importation en cours : le véhicule est en cours d'acheminement",
+  livraison: "en livraison : le véhicule est arrivé et sa remise au client se prépare",
+  terminee: "terminée : la demande est clôturée",
+  annulee: "annulée",
+};
+const SQL_PHONE = (col) => `replace(replace(replace(replace(${col}, ' ', ''), '+', ''), '-', ''), '.', '')`;
+
+/**
+ * Demandes d'importation déposées avec le numéro de téléphone qui écrit sur WhatsApp (8 derniers chiffres).
+ * Un dossier déposé avec un autre numéro n'est jamais lu : l'agent ne peut donc rien en dire.
+ */
+async function loadImports(env, phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  if (digits.length < 8 || isTest(phone)) return [];
+  const { results } = await env.DB.prepare(
+    `SELECT number, wanted_model, year_range, budget, message, status, admin_note, created_at
+       FROM imports WHERE ${SQL_PHONE("phone")} LIKE ? ORDER BY id DESC LIMIT 5`
+  ).bind("%" + digits.slice(-8)).all();
+  const day = (d) => { const m = String(d || "").match(/^(\d{4})-(\d{2})-(\d{2})/); return m ? `${m[3]}/${m[2]}/${m[1]}` : ""; };
+  const one = (t, n) => String(t || "").replace(/\s+/g, " ").trim().slice(0, n);
+  return (results || []).map((r) => [
+    `• ${r.number} — ${one(r.wanted_model, 80)}${r.year_range ? ", année " + one(r.year_range, 30) : ""}`,
+    Number(r.budget) > 0 ? `budget annoncé ${fcfa(r.budget)}` : null,
+    r.message ? `précision du client : « ${one(r.message, 200)} »` : null,
+    day(r.created_at) ? `déposée le ${day(r.created_at)}` : null,
+    `ÉTAPE ACTUELLE : ${IMPORT_STEPS[r.status] || r.status}`,
+    r.admin_note ? `message de la concession pour le client : « ${one(r.admin_note, 400)} »` : null,
+  ].filter(Boolean).join(" — "));
+}
+
 const PART_CATEGORY = { moteur: "Moteur", freinage: "Freinage", carrosserie: "Carrosserie", electricite: "Électricité", pneus: "Pneus", batteries: "Batteries", entretien: "Entretien", accessoires: "Accessoires" };
 
 async function loadKnowledge(env, phone) {
   const safe = async (p, def) => { try { return await p; } catch (e) { console.error("knowledge", e.message); return def; } };
   const digits = String(phone || "").replace(/\D/g, "");
-  const [settings, zones, parts, leads, prospect, bought] = await Promise.all([
+  const [settings, zones, parts, leads, prospect, bought, imports] = await Promise.all([
     safe(env.DB.prepare(`SELECT key, value FROM settings WHERE key IN ('hours', 'payment_modes', 'reservation_days')`).all().then((r) => r.results || []), []),
     safe(env.DB.prepare(`SELECT name, fee FROM delivery_zones WHERE active = 1 ORDER BY fee, name`).all().then((r) => r.results || []), []),
     safe(env.DB.prepare(`SELECT name, category, price, stock FROM parts WHERE published = 1 ORDER BY category, price LIMIT 80`).all().then((r) => r.results || []), []),
@@ -211,6 +247,7 @@ async function loadKnowledge(env, phone) {
             WHERE s.status != 'annulee' AND replace(replace(replace(replace(c.phone, ' ', ''), '+', ''), '-', ''), '.', '') LIKE ?`
         ).bind("%" + digits.slice(-8)).first().then((r) => Number(r?.n) > 0), false)
       : false,
+    safe(loadImports(env, phone), []),
   ]);
   const s = Object.fromEntries(settings.map((r) => [r.key, r.value]));
   let modes = [];
@@ -219,7 +256,7 @@ async function loadKnowledge(env, phone) {
   const paid = zones.filter((z) => Number(z.fee) > 0).map((z) => `${z.name} ${fcfa(z.fee)}`);
   const cap = (t) => { t = String(t || "").trim().toLowerCase(); return t.replace(/(^|[\s-])\S/g, (c) => c.toUpperCase()); };
   return {
-    prospect, bought,
+    prospect, bought, imports,
     hours: s.hours || "",
     modes: Array.isArray(modes) ? modes : [],
     reservationDays: Number(s.reservation_days) || 7,
@@ -384,6 +421,16 @@ Tiens la fiche à jour avec l'outil noter_prospect chaque fois que tu apprends q
 - prêt à acheter : prix accepté, visite fixée, réservation ou achat demandé.
 - perdu : il a acheté ailleurs ou n'est plus intéressé.
 Dès que le client donne son prénom, son budget ou son usage, note-le dans ce même tour. Écris d'abord ta réponse au client, puis appelle noter_prospect dans le même tour. Le client ne voit jamais cette fiche ; n'en parle pas. S'il demande qu'on ne le relance plus, mets ne_plus_contacter à vrai.
+
+SUIVI DES DEMANDES D'IMPORTATION
+${know.imports && know.imports.length ? `Demandes d'importation déposées avec le numéro WhatsApp de ce client (lues à l'instant dans le logiciel de la concession) :
+${know.imports.join("\n")}
+- Quand il demande où en est sa demande, réponds toi-même, tout de suite : rappelle le modèle demandé et dis l'étape actuelle avec des mots simples. S'il y a un message de la concession pour lui, transmets-le fidèlement.
+- Tu ne connais que l'étape actuelle. N'invente ni la suite, ni une date, ni un délai chiffré, ni un véhicule trouvé, ni un prix. S'il veut plus de détails que ce qui est écrit ici (délai, véhicule trouvé, montant à payer), dis ce que tu sais, puis qu'un conseiller client va lui répondre très vite, et appelle enregistrer_contact (motif question-sans-reponse).
+- Une simple demande de suivi à laquelle tu as répondu ne demande PAS d'appeler enregistrer_contact.
+- Étape « en validation » : précise qu'un conseiller client le contacte pour valider la proposition avec lui. Demande annulée : dis-le avec tact et propose qu'un conseiller client lui en parle (enregistrer_contact).
+- S'il cite un numéro IMP-… qui n'est pas dans cette liste : voir la règle ci-dessous.` : "Aucune demande d'importation n'est enregistrée avec le numéro WhatsApp de ce client."}
+- Numéro IMP-… absent de la liste ci-dessus : tu n'as accès qu'aux demandes déposées avec le numéro de téléphone qui t'écrit. Dis simplement que tu ne retrouves pas cette demande avec ce numéro WhatsApp, demande-lui avec quel numéro de téléphone il l'a déposée, dis qu'un conseiller client va lui répondre très vite, et appelle enregistrer_contact (motif question-sans-reponse, avec le numéro IMP-… dans le résumé). Rappelle qu'il peut aussi la suivre sur becaneetequipement.com/importation avec le numéro reçu. Ne dis jamais qu'une demande existe ou n'existe pas, et ne donne aucune information sur une demande qui n'est pas dans la liste.
 
 MESSAGES DU CONSEILLER
 Dans l'historique, les messages qui commencent par « [Conseiller client] » ont été écrits par un conseiller de la concession. Ce qu'il a dit fait foi (prix accordé, rendez-vous, disponibilité) : reste cohérent avec lui et ne le contredis jamais.
