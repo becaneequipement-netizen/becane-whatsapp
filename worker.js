@@ -568,7 +568,8 @@ ${know.dossier.join("\n")}
 - Ne réclame jamais un paiement de toi-même et ne parle d'un reste à payer que si le client pose la question. Jamais de reproche ni de pression sur un retard.
 - Tu ne modifies rien : annulation, remboursement, report d'échéance, changement de moto ou de montant, envoi d'une facture ou d'un reçu, estimation d'une reprise. Pour ces demandes, dis qu'un conseiller client va lui répondre très vite et appelle enregistrer_contact.
 - S'il conteste un montant ou dit avoir payé autre chose : ne le contredis pas, dis qu'un conseiller client vérifie et lui répond très vite, et appelle enregistrer_contact (motif reclamation).
-- Demande annulée, expirée ou non retenue : dis-le avec tact, sans inventer de raison, et propose qu'un conseiller client lui en parle (enregistrer_contact).
+- Demande annulée, expirée ou non retenue : le client doit l'apprendre de TOI, dans ce message. Dis-le clairement et avec tact (par exemple « Votre demande de paiement par tranche du 12/10 pour une Honda PCX 2022 n'a pas été retenue par la concession »), sans inventer de raison. Puis demande-lui s'il souhaite qu'un conseiller client lui en parle, ou propose-lui une autre solution (un scooter du stock, une nouvelle demande). N'appelle PAS enregistrer_contact à ce moment-là : tu ne l'appelles que s'il répond qu'il veut en parler à un conseiller ou s'il demande la raison.
+- RÈGLE D'OR DU DOSSIER : ton message au client contient toujours l'information elle-même (l'état, l'étape, le montant). « Un conseiller client va vous répondre » ne remplace jamais cette information : c'est un complément, quand il en faut un. N'écris jamais seulement que le conseiller est prévenu alors que la réponse est écrite ci-dessus.
 - Garantie : donne ce qui est écrit et la date de l'achat. Pour une panne ou une prise en charge, c'est le conseiller client qui décide : enregistrer_contact (motif reclamation).
 - Importation : rappelle le modèle et dis l'étape actuelle avec des mots simples ; transmets fidèlement le message de la concession s'il y en a un. Étape « en validation » : un conseiller client le contacte pour valider la proposition avec lui.
 - Ne récite pas tout le dossier : réponds à la question posée, en une ou deux phrases.` : "Rien n'est enregistré dans le logiciel avec le numéro WhatsApp de ce client (ni achat, ni réservation, ni paiement par tranche, ni commande, ni reprise, ni importation)."}
@@ -785,7 +786,7 @@ async function runClaude(env, system, history, phone, profileName, origin, stock
     }
     if (after) await saveProspect(env, phone, after).catch((e) => console.error("prospect", e));
     // Le texte écrit avant un appel d'outil n'est pas envoyé : on le rappelle, sinon la réponse finale oublie l'essentiel.
-    if (results.length) results[results.length - 1].content += "\n\nRappel : rien n'a encore été envoyé au client. Écris maintenant ta réponse COMPLÈTE, en reprenant ce que tu avais commencé à lui dire avant cet appel (la réponse à sa question d'abord, la suite ensuite).";
+    if (results.length) results[results.length - 1].content += "\n\nRappel : rien n'a encore été envoyé au client. Écris maintenant ta réponse COMPLÈTE, en reprenant ce que tu avais commencé à lui dire avant cet appel (la réponse à sa question d'abord, la suite ensuite). Si sa question porte sur son dossier (état d'une demande, paiement, reste à payer), ta réponse doit donner cette information elle-même : dire seulement que le conseiller est prévenu ne suffit pas.";
     messages.push({ role: "user", content: results });
   }
   return "Merci pour votre message 🙏 Un conseiller client va vous répondre très vite.";
