@@ -3,7 +3,7 @@
  * Servi par ce Worker sur achat.becaneetequipement.com (et sur /achat de l'adresse workers.dev).
  *
  * Secrets (Settings > Variables and Secrets) :
- *   ACHAT_API_KEY   -> clé API Claude réservée à l'agent d'achat (obligatoire pour que l'agent réponde)
+ *   ACHAT_API_KEY   -> clé API Claude réservée à l'agent d'achat (facultatif : à défaut, la clé ANTHROPIC_API_KEY de l'agent WhatsApp)
  *   ACHAT_PASSWORD  -> mot de passe de l'application (à défaut : INBOX_PASSWORD)
  * Variable facultative : ACHAT_MODEL (défaut : claude-sonnet-5-5)
  *
@@ -24,6 +24,7 @@ const SUP_KEYS = ["nom", "type", "pays", "ville", "site", "adresse", "contact", 
 
 const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" } });
 const html = (s, status = 200, extra = {}) => new Response(s, { status, headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-robots-tag": "noindex", ...extra } });
+const apiKey = (env) => env.ACHAT_API_KEY || env.ANTHROPIC_API_KEY || "";
 const password = (env) => env.ACHAT_PASSWORD || env.INBOX_PASSWORD || "";
 
 async function hmacHex(secret, data) {
@@ -97,7 +98,7 @@ async function runTool(env, name, input) {
 async function callClaude(env, body) {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
-    headers: { "x-api-key": env.ACHAT_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" },
+    headers: { "x-api-key": apiKey(env), "anthropic-version": "2023-06-01", "content-type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) { const e = new Error((await res.text()).slice(0, 500)); e.status = res.status; throw e; }
@@ -105,7 +106,7 @@ async function callClaude(env, body) {
 }
 function frError(e) {
   const m = String(e && e.message || "");
-  if (e && e.status === 401) return "La clé Claude de l'application est refusée. Vérifie le secret ACHAT_API_KEY dans Cloudflare.";
+  if (e && e.status === 401) return "La clé Claude de l'application est refusée. Vérifie la clé Claude installée dans Cloudflare.";
   if (/credit balance|billing|insufficient/i.test(m)) return "Le crédit de la clé Claude est épuisé. Recharge-le sur platform.claude.com.";
   if (e && e.status === 429) return "Trop de demandes en même temps. Réessaie dans une minute.";
   if (e && e.status === 404) return "Le modèle Claude demandé est introuvable. Vérifie la variable ACHAT_MODEL.";
@@ -113,7 +114,7 @@ function frError(e) {
   return "L'agent n'a pas pu répondre. Réessaie." + (m ? " (" + m.slice(0, 160) + ")" : "");
 }
 async function runAgent(env, input) {
-  if (!env.ACHAT_API_KEY) return { error: "La clé Claude de l'application n'est pas encore installée (secret ACHAT_API_KEY dans Cloudflare)." };
+  if (!apiKey(env)) return { error: "Aucune clé Claude n'est installée dans Cloudflare (secret ACHAT_API_KEY ou ANTHROPIC_API_KEY)." };
   const turns = (Array.isArray(input.messages) ? input.messages : []).filter((m) => m && (m.role === "user" || m.role === "assistant") && typeof m.content === "string" && m.content.trim());
   if (!turns.length || turns[turns.length - 1].role !== "user") return { error: "Demande vide." };
   if (JSON.stringify(turns).length > 400000) return { error: "Cette mission est devenue trop longue. Lance une nouvelle mission." };
@@ -207,7 +208,7 @@ export async function handleAchat(request, env, ctx, path, base) {
   await ensureSchema(env);
   const route = path.slice(5);
   try {
-    if (route === "status" && request.method === "GET") return json({ key: !!env.ACHAT_API_KEY });
+    if (route === "status" && request.method === "GET") return json({ key: !!apiKey(env) });
     if (route === "stats" && request.method === "GET") { const { results } = await env.DB.prepare(SQL_STATS).all(); return json({ rows: results || [] }); }
     if (route === "docs" && request.method === "GET") {
       const coll = url.searchParams.get("coll") || "";
