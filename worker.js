@@ -26,6 +26,8 @@
  * commandes de pièces, reprises et demandes d'importation (voir loadDossier).
  */
 
+import { handleAchat } from "./achat.js";
+
 const DEFAULTS = {
   CLAUDE_MODEL: "claude-haiku-5-5",
   FREE_MODEL: "@cf/mistralai/mistral-small-3.1-24b-instruct",
@@ -1661,6 +1663,11 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const origin = url.origin;
+
+    // Bureau d'achat (agent d'achat et d'importation) : sur achat.becaneetequipement.com, ou sous /achat ici.
+    if (url.hostname.startsWith("achat.")) return handleAchat(request, env, ctx, url.pathname === "/" ? "" : url.pathname, "");
+    if (url.pathname === "/achat" || url.pathname.startsWith("/achat/")) return handleAchat(request, env, ctx, url.pathname.slice(6), "/achat");
+
     await ensureSchema(env);
 
     // 1) Vérification du webhook par Meta
